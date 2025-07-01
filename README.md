@@ -1,20 +1,46 @@
 # lazy-mysql-wizard
-Python tkinter util application that provides handy MySQL and GPT-4.1 integration, allowing you to ask an AI MySQL expert to alter your database.
-Perfect for those that don't have the time or are too lazy to learn all MySQL terms, syntax and best practices. lazy-mysql-wizard provides you with a SQL expert AI assistant to help make any changes you'd like to your database. You will clearly see what commands the AI wishes to run and can edit, run, and view tables with this app.
-![image](https://github.com/user-attachments/assets/b5322851-ec20-4c84-b0fd-26e987c91978)
 
-setup:
--install the required libraries (listed in requirements.txt) in the CLI you can do 'pip install -r requirements.txt
--provide env variables for the DB connection string or credentials in the .env file
--run the python script to launch the application
+A modern Python Tkinter application for effortless MySQL database management, powered by GPT-4.1 AI integration. 
 
-The AI chat feature is context-aware of your database's schema and will generate queries or sets of queries acting as a MySQL DB specalist on your behalf. Saves you time and effort from learning MySQL, or cumbersome prompting with ChatGPT (or other AI assistant) to get SQL queries and run them. This app also acts as a lightweight DB viewer, similiar to Phpmyadmin. the AI features are optional and an API key isn't required
+## Features
+- **AI MySQL Assistant**: Ask an AI expert to generate, review, and run SQL queries for you. The AI is context-aware of your database schema and can chain together complex operations, only asking for confirmation when needed.
+- **Modern GUI**: Clean, flat, and responsive interface with dark mode, section borders, and a results table.
+- **SQL Editor & History**: Edit, review, and run SQL queries. Browse your query history with up/down arrows.
+- **Results Viewer**: View, select, and copy table results. Highlight and preview cell values.
+- **AI Chat**: Natural language chat with the AI, which can plan, reason, and execute database operations on your behalf.
+- **Safety**: The AI will only ask for confirmation before running data-changing queries (INSERT, UPDATE, DELETE). SELECT queries and safe operations are run automatically.
+- **Customizable**: Edit queries before running, and view all AI-generated SQL before execution.
+- **No API Key Required**: AI features are optional; you can use the app as a lightweight DB viewer without OpenAI integration.
 
-Shortcuts:
-ctrl + d: toggle between light and dark mode
-ctrl + enter: run query (when cursor is in query edit box)
-ctrl + shift + enter: turn the text in the edit box into a prompt, returns the AI generated prompt
-up / down keys: toggle through previosuly executed MySQL commands
+![screenshot](https://github.com/user-attachments/assets/b5322851-ec20-4c84-b0fd-26e987c91978)
+
+## Setup
+1. **Install dependencies**
+   ```sh
+   pip install -r requirements.txt
+   ```
+2. **Configure database connection**
+   - Set your DB credentials in a `.env` file or directly in the script.
+3. **Run the app**
+   ```sh
+   python db_viewer_gui.py
+   ```
+
+## Keyboard Shortcuts
+- `Ctrl+D`: Toggle light/dark mode
+- `Ctrl+Enter`: Run query (when in SQL editor)
+- `Ctrl+Shift+Enter`: Use AI to generate a query from your prompt
+- `Up/Down`: Browse previous SQL commands
+
+## Why Use lazy-mysql-wizard?
+- No need to memorize MySQL syntax or best practices
+- Get expert-level SQL help instantly
+- Edit, review, and run queries safely
+- Modern, user-friendly interface
+- Optional AI features—works as a classic DB viewer too
+
+## Author
+- Xander
 
 Happy Programming!
-- Xander
+
