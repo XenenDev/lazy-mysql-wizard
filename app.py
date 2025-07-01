@@ -20,8 +20,10 @@ DB_CONFIG = {
 }
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+
 # --- DB UTILS ---
 def connect_to_database():
+    """Establishes a connection to the MySQL database using the global DB_CONFIG."""
     try:
         return mysql.connector.connect(**DB_CONFIG)
     except Exception as e:
@@ -29,6 +31,7 @@ def connect_to_database():
         return None
 
 def get_tables_and_columns():
+    """Fetches the schema (table names and their columns) from the database."""
     connection = connect_to_database()
     tables = {}
     if not connection:
@@ -42,71 +45,88 @@ def get_tables_and_columns():
     except Exception as e:
         messagebox.showerror("DB Error", str(e))
     finally:
-        connection.close()
+        if connection:
+            connection.close()
     return tables
 
 def run_query(query):
+    """
+    Executes a given SQL query on the database.
+    Returns (columns, results) for SELECT queries or (None, message) for other queries/errors.
+    """
     connection = connect_to_database()
     if not connection:
-        return None, None
+        return None, None # Connection failed, return None for both
     try:
         cursor = connection.cursor()
         cursor.execute(query)
-        if query.strip().lower().startswith("select"):
+        # Check if the query is a SELECT statement to fetch results
+        if query.strip().lower().startswith("select") or query.strip().lower().startswith("show"):
             if cursor.description is None:
-                return None, "No results."
+                return [], [] # No columns or results for some SHOW commands
             columns = [desc[0] for desc in cursor.description]
             results = cursor.fetchall() or []
             return columns, results
         else:
+            # For DML/DDL queries, commit changes and return success message
             connection.commit()
             return None, f"Query executed successfully: {query}"
     except Exception as e:
+        # Return error message if query fails
         return None, str(e)
     finally:
-        connection.close()
+        if connection:
+            connection.close()
 
 # --- OPENAI ---
 openai_client = openai.Client(api_key=OPENAI_API_KEY)
 
 def ask_ai(messages):
+    """Sends a list of messages to the AI model and returns the text response."""
     try:
-        response = openai_client.responses.create(
-            model="gpt-4.1-mini",
-            input=messages
+        response = openai_client.chat.completions.create( # Use chat.completions.create for chat models
+            model="gpt-4o-mini", # Using gpt-4o-mini as a common alternative
+            messages=messages # 'messages' instead of 'input' for chat models
         )
-        return response.output_text
+        return response.choices[0].message.content
     except Exception as e:
         return f"AI Error: {e}"
 
 def ask_ai_with_tools(messages, tool_outputs=None):
     """
-    Use OpenAI tool-calling API to allow the AI to request running SQL queries.
+    Uses OpenAI tool-calling API to allow the AI to request running SQL queries.
     If tool_outputs is provided, it should be a list of tool call output messages.
     """
     tools = [{
         "type": "function",
-        "name": "run_sql_query",
-        "description": "Run a SQL query on the MySQL database. Only use this tool for safe, well-formed queries that match the schema. You don't need to ask the user to confirm the running of a query as the user will be asked to confirm it automatically through the app's gui. The user may choose to edit the query before running it through the gui, meaning the result may be different from what you expected, you will always be notified of the final query that was run.",
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "The SQL query to run."}
-            },
-            "required": ["query"],
-            "additionalProperties": False
+        "function": {
+            "name": "run_sql_query",
+            "description": "Run a SQL query on the MySQL database. Only use this tool for safe, well-formed queries that match the schema. You don't need to ask the user to confirm the running of a query as the user will be asked to confirm it automatically through the app's gui. The user may choose to edit the query before running it through the gui, meaning the result may be different from what you expected, you will always be notified of the final query that was run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The SQL query to run."}
+                },
+                "required": ["query"],
+            }
         }
     }]
     input_msgs = messages.copy()
     if tool_outputs:
         input_msgs.extend(tool_outputs)
-    response = openai_client.responses.create(
-        model="gpt-4.1-mini",
-        input=input_msgs,
-        tools=tools,
-    )
-    return response
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini", # Using gpt-4o-mini as a common alternative
+            messages=input_msgs,
+            tools=tools,
+            tool_choice="auto" # Let the model decide whether to call a tool
+        )
+        return response.choices[0].message # Return the message object directly
+    except Exception as e:
+        # Return a message object with error content
+        return type('obj', (object,), {'content': f"AI Error: {e}", 'tool_calls': None})()
+
 
 # --- DPI AWARENESS (Windows) ---
 if sys.platform == "win32":
@@ -121,11 +141,10 @@ class DBViewerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Database Viewer & AI Chat")
-        self.geometry("900x1000")
+        self.geometry("1200x1000")
         self.is_dark_mode = False
-        self.set_modern_style()
+        self.create_widgets() # Create widgets and set initial style properties
         self.tables = get_tables_and_columns()
-        self.create_widgets()
         self.chat_history = []
         self.sql_history = []
         self.sql_history_index = None
@@ -138,6 +157,10 @@ class DBViewerGUI(tk.Tk):
         self.attributes('-topmost', True)
         self.after(100, lambda: self.attributes('-topmost', False))
         self.focus_force()
+
+        # State variables for button disabling
+        self.is_query_running = False
+        self.is_ai_thinking = False
 
     def set_modern_style(self):
         """Apply a modern, flat style to the app. Supports light and dark mode."""
@@ -152,18 +175,23 @@ class DBViewerGUI(tk.Tk):
             border = "#444"
             entry_bg = "#2c313a"
             select_bg = "#3a3f4b"
+            chat_user_bg = "#4a4e55" # Darker background for user messages
+            chat_ai_bg = "#3a3f4b"   # Slightly lighter background for AI messages
         else:
             bg = "#f3f3f3"
             fg = "#222"
             border = "#bbb"
             entry_bg = "#f3f3f3"
             select_bg = "#cce5ff"
+            chat_user_bg = "#e0e0e0" # Light background for user messages
+            chat_ai_bg = "#f0f0f0"   # Even lighter background for AI messages
+
         self.configure(background=bg)  # Set root window background
         default_font = ("Segoe UI", 12)
         self.option_add("*Font", default_font)
         self.option_add("*TButton.Font", default_font)
         self.option_add("*TLabel.Font", default_font)
-        self.option_add("*TEntry.Font", default_font)
+        # self.option_add("*TEntry.Font", default_font) # Removed for multiline chat_entry
         self.option_add("*Treeview.Heading.Font", ("Segoe UI Semibold", 12))
         style.configure("TFrame", background=bg)
         style.configure("TLabel", background=bg, foreground=fg)
@@ -176,18 +204,30 @@ class DBViewerGUI(tk.Tk):
         style.configure("Vertical.TScrollbar", gripcount=0, background=bg, troughcolor=bg, bordercolor=bg, arrowcolor=fg)
         style.configure("Horizontal.TScrollbar", gripcount=0, background=bg, troughcolor=bg, bordercolor=bg, arrowcolor=fg)
         style.map("TButton", focuscolor=[('!focus', 'none')])
+
         self.section_border_color = border
         self.section_bg = bg
         self.section_fg = fg
         self.entry_bg = entry_bg
         self.select_bg = select_bg
 
+        # Re-apply chat display tags with current colors
+        # Ensure chat_display exists before configuring its tags
+        if hasattr(self, 'chat_display'):
+            # Swapped justify for user and AI messages
+            self.chat_display.tag_configure("user", foreground=fg, background=chat_user_bg, justify='right', lmargin1=10, lmargin2=10, rmargin=10)
+            self.chat_display.tag_configure("ai", foreground=fg, background=chat_ai_bg, justify='left', lmargin1=10, lmargin2=10, rmargin=10)
+            self.chat_display.tag_configure("separator", foreground=border, background=bg, justify='center')
+
+
     def toggle_dark_mode(self, event=None):
+        """Toggles between dark and light mode and updates the UI style."""
         self.is_dark_mode = not self.is_dark_mode
         self.set_modern_style()
         self.update_section_styles()
 
     def update_section_styles(self):
+        """Updates the styles of various UI elements based on the current theme."""
         # Update backgrounds and borders for all section frames and widgets
         self.configure(background=self.section_bg)  # Update root window background
         for frame in [self.sql_section, self.result_section, self.chat_section]:
@@ -198,11 +238,15 @@ class DBViewerGUI(tk.Tk):
         self.result_tree.tag_configure('selected_cell', background=self.select_bg)
         self.selected_value_label.config(background=self.section_bg, foreground=self.section_fg)
         self.chat_display.config(background=self.entry_bg, foreground=self.section_fg, insertbackground=self.section_fg)
-        # Remove direct config for ttk.Entry (not supported)
-        # self.chat_entry.config(background=self.entry_bg, foreground=self.section_fg, insertbackground=self.section_fg)
+        # Update chat entry (now scrolledtext)
+        self.chat_entry.config(background=self.entry_bg, foreground=self.section_fg, insertbackground=self.section_fg,
+                               highlightbackground=self.section_border_color, highlightcolor=self.section_border_color) # Added highlight for border
 
     def create_widgets(self):
         """Set up all widgets for the GUI."""
+        # Call set_modern_style first to initialize style properties
+        self.set_modern_style()
+
         # SQL Editor Section
         self.sql_section = tk.Frame(self, background=self.section_bg, highlightbackground=self.section_border_color, highlightcolor=self.section_border_color, highlightthickness=1, bd=0)
         self.sql_section.pack(fill='x', padx=16, pady=(16, 8))
@@ -213,12 +257,14 @@ class DBViewerGUI(tk.Tk):
         self.sql_text.bind('<Control-Return>', self.ctrl_enter_run_query)
         self.sql_text.bind('<Control-Shift-Return>', lambda e: self.use_ai_for_query())
         self.sql_text.bind('<Control-Shift-Enter>', lambda e: self.use_ai_for_query())
+
         btn_frame = ttk.Frame(self.sql_section)
         btn_frame.pack(fill='x', padx=0, pady=(8, 0))
-        run_btn = ttk.Button(btn_frame, text="Run Query", command=self.run_sql_query)
-        run_btn.pack(side='right', padx=(8,0))
-        ai_btn = ttk.Button(btn_frame, text="Use AI", command=self.use_ai_for_query)
-        ai_btn.pack(side='right', padx=(8,0))
+        self.run_btn = ttk.Button(btn_frame, text="Run Query", command=self.run_sql_query)
+        self.run_btn.pack(side='right', padx=(8,0))
+        self.ai_btn = ttk.Button(btn_frame, text="Use AI", command=self.use_ai_for_query)
+        self.ai_btn.pack(side='right', padx=(8,0))
+
         # Results Section
         self.result_section = tk.Frame(self, background=self.section_bg, highlightbackground=self.section_border_color, highlightcolor=self.section_border_color, highlightthickness=1, bd=0)
         self.result_section.pack(fill='both', expand=True, padx=16, pady=(8, 4))
@@ -239,128 +285,226 @@ class DBViewerGUI(tk.Tk):
         self.selected_col = None
         self.selected_value_label = ttk.Label(self.result_section, text="Selected: None", anchor='w', background=self.section_bg, foreground=self.section_fg)
         self.selected_value_label.pack(fill='x', padx=2, pady=(4,0))
+
         # AI Chat Section
         self.chat_section = tk.Frame(self, background=self.section_bg, highlightbackground=self.section_border_color, highlightcolor=self.section_border_color, highlightthickness=1, bd=0)
         self.chat_section.pack(fill='both', expand=True, padx=16, pady=(4, 16))
         self.chat_label = ttk.Label(self.chat_section, text="AI Chat", font=("Segoe UI Semibold", 13), background=self.section_bg, foreground=self.section_fg)
         self.chat_label.pack(anchor='w', padx=2, pady=(0, 4))
+
         self.chat_display = scrolledtext.ScrolledText(self.chat_section, height=8, state='normal', wrap='word', font=("Segoe UI", 12), borderwidth=0, relief="flat", background=self.entry_bg, foreground=self.section_fg, insertbackground=self.section_fg)
         self.chat_display.pack(fill='both', expand=True, padx=0, pady=(0,0))
         self.chat_display.config(state='disabled')
+
+        # Enable text selection in chat_display
+        self.chat_display.config(state='normal')  # Allow selection
+        self.chat_display.bind('<1>', lambda e: self.chat_display.focus_set())  # Focus on click
+        self.chat_display.config(state='disabled')  # Keep disabled for editing, but selection is possible
+
+        # Chat message tags configured here, after chat_display is created
+        # These will be updated again in set_modern_style and update_section_styles for theme changes
+        # Swapped justify for user and AI messages
+        self.chat_display.tag_configure("user", justify='right', lmargin1=10, lmargin2=10, rmargin=10)
+        self.chat_display.tag_configure("ai", justify='left', lmargin1=10, lmargin2=10, rmargin=10)
+        self.chat_display.tag_configure("separator", justify='center')
+
+
         chat_entry_frame = ttk.Frame(self.chat_section)
         chat_entry_frame.pack(fill='x', padx=0, pady=(8,0), side='bottom')
-        self.chat_entry = ttk.Entry(chat_entry_frame, font=("Segoe UI", 12))
+
+        # Changed to ScrolledText for multiline chat input
+        # Added highlightthickness and highlightbackground for a visible border
+        self.chat_entry = scrolledtext.ScrolledText(chat_entry_frame, height=3, font=("Segoe UI", 12), borderwidth=1, relief="flat",
+                                                    background=self.entry_bg, foreground=self.section_fg, insertbackground=self.section_fg,
+                                                    highlightthickness=1, highlightbackground=self.section_border_color)
         self.chat_entry.pack(side='left', fill='x', expand=True)
-        self.chat_entry.bind('<Return>', self.send_chat)
-        send_btn = ttk.Button(chat_entry_frame, text="Send", command=self.send_chat)
-        send_btn.pack(side='left', padx=(8,0))
-        self.send_btn = send_btn  # Reference to toggle state
-        clear_btn = ttk.Button(chat_entry_frame, text="Clear Chat", command=self.clear_chat)
+        self.chat_entry.bind('<Control-Return>', self.send_chat) # Bind Ctrl+Enter to send_chat
+
+        self.send_btn = ttk.Button(chat_entry_frame, text="Send", command=self.send_chat)
+        self.send_btn.pack(side='left', padx=(8,0))
+
+        clear_btn = ttk.Button(chat_entry_frame, text="Clear Chat", command=self.confirm_clear_chat)
         clear_btn.pack(side='left', padx=(8,0))
+
         # Update all section styles for current mode
         self.update_section_styles()
 
+    def set_query_running_state(self, running):
+        """Sets the state of query-related buttons and flags."""
+        self.is_query_running = running
+        state = 'disabled' if running else 'normal'
+        self.run_btn.config(state=state)
+        self.ai_btn.config(state=state)
+
+    def set_ai_thinking_state(self, thinking):
+        """Sets the state of AI chat-related buttons and flags."""
+        self.is_ai_thinking = thinking
+        state = 'disabled' if thinking else 'normal'
+        self.send_btn.config(state=state, text="Thinking..." if thinking else "Send")
+        self.chat_entry.config(state=state)
+        if thinking:
+            self.chat_entry.delete('1.0', tk.END)
+            self.chat_entry.insert(tk.END, "Thinking...")
+            self.chat_entry.mark_set(tk.INSERT, tk.END) # Set cursor to end
+        else:
+            self.chat_entry.delete('1.0', tk.END) # Clear "Thinking..."
+            self.chat_entry.focus_set()
+
+    def refresh_schema(self):
+        """Refresh the schema cache from the database."""
+        self.tables = get_tables_and_columns()
+
+    def get_latest_schema_string(self):
+        """Always fetch the latest schema from the DB and return as a string for prompts."""
+        tables = get_tables_and_columns()
+        schema_string = ""
+        for table_name, columns in tables.items():
+            schema_string += f"Table: {table_name}\n"
+            for col in columns:
+                schema_string += f" - {col}\n"
+            schema_string += "\n"
+        return schema_string
+
+    def _execute_sql_and_handle_tool_output(self, query, tool_call_obj=None):
+        """
+        Executes a SQL query and handles potential tool output for AI continuation.
+        This function is intended to be called synchronously within a thread.
+        """
+        columns, result = run_query(query) # Synchronous DB call
+
+        # If DDL, refresh schema
+        if query.strip().split()[0].lower() in {"create", "drop", "alter", "rename"}:
+            self.refresh_schema()
+
+        # Update UI with results (must be done on the main thread)
+        self.after(0, lambda: self._update_result_tree(columns, result))
+
+        # If this execution was triggered by an AI tool call, prepare and append tool output
+        if tool_call_obj:
+            tool_output_msg = {
+                "role": "tool",
+                "tool_call_id": tool_call_obj.id,
+                "content": json.dumps({
+                    "query_executed": query,
+                    "columns": columns,
+                    "result": result
+                }, default=str)
+            }
+            self.chat_history.append(tool_output_msg)
+            return True # Indicate that tool output was handled
+        return False # Indicate no tool output handling was done
+
+    def _update_result_tree(self, columns, result):
+        """Helper to update the result treeview on the main thread."""
+        self.result_tree.delete(*self.result_tree.get_children())
+        if columns:
+            self.result_tree['columns'] = columns
+            for col in columns:
+                self.result_tree.heading(col, text=col)
+            if result:
+                for row in result:
+                    self.result_tree.insert('', tk.END, values=list(row) if not isinstance(row, (list, tuple)) else row)
+        else:
+            msg = result if isinstance(result, str) else str(result)
+            messagebox.showinfo("Query Result", msg)
+
+
     def run_sql_query(self):
-        """Run the SQL query in the editor and display results. If a tool call is pending, send result back to AI."""
+        """Run the SQL query in the editor and display results."""
+        if self.is_query_running:
+            return
+
         query = self.sql_text.get('1.0', tk.END).strip()
         if not query:
             return
+
+        self.set_query_running_state(True)
+
         if not self.sql_history or (self.sql_history and query != self.sql_history[-1]):
             self.sql_history.append(query)
         self.sql_history_index = None
-        def run():
-            columns, result = run_query(query)
-            self.result_tree.delete(*self.result_tree.get_children())
-            if columns:
-                self.result_tree['columns'] = columns
-                for col in columns:
-                    self.result_tree.heading(col, text=col)
-                if result:
-                    for row in result:
-                        self.result_tree.insert('', tk.END, values=list(row) if not isinstance(row, (list, tuple)) else row)
+
+        # Execute in a new thread to keep GUI responsive
+        def run_in_thread():
+            # If there's a pending tool call, it means this run was triggered by AI.
+            # We need to pass the pending_tool_call to the synchronous executor.
+            current_pending_tool_call = self.pending_tool_call
+            self.pending_tool_call = None # Clear it immediately
+
+            tool_output_handled = self._execute_sql_and_handle_tool_output(query, current_pending_tool_call)
+
+            if tool_output_handled:
+                # If tool output was handled, continue AI conversation
+                self.continue_ai_conversation()
             else:
-                msg = result if isinstance(result, str) else str(result)
-                messagebox.showinfo("Result", msg)
-            # If a tool call is pending, send result back to AI
-            if hasattr(self, 'pending_tool_call') and self.pending_tool_call:
-                tool_call = self.pending_tool_call
-                del self.pending_tool_call
-                # Prepare tool output message
-                # Include executed query and result (including errors) for AI awareness
-                tool_output_msg = {
-                    "type": "function_call_output",
-                    "call_id": tool_call.call_id,
-                    "output": json.dumps({
-                        "query_executed": query,
-                        "columns": columns,
-                        "result": result
-                    }, default=str)
-                }
-                # Continue the AI chat loop with the tool output
-                def continue_ai():
-                    # Show thinking state during AI continuation
-                    self.disable_chat_input()
-                    try:
-                        # Rebuild messages up to the tool call
-                        schema_string = ""
-                        for table_name, columns_ in self.tables.items():
-                            schema_string += f"Table: {table_name}\n"
-                            for col in columns_:
-                                schema_string += f" - {col}\n"
-                            schema_string += "\n"
-                        system_prompt = (
-                            "You are a helpful, high-agency AI assistant for SQL and database questions. "
-                            "The user has approved and executed a SQL query. Use the provided output to inform your next reasoning steps without asking for confirmation again. "
-                            "Suggest additional safe, well-formed SQL queries matching the schema only if needed, and do not request confirmation for already executed actions. "
-                            "Here is the schema for all tables in the database:\n\n" + schema_string
-                        )
-                        messages = [
-                            {"role": "system", "content": system_prompt}
-                        ] + self.chat_history + [tool_call]
-                        tool_outputs = [tool_output_msg]
-                        response = ask_ai_with_tools(messages, tool_outputs)
-                        for msg in response.output:
-                            if msg.type == "function_call":
-                                args2 = json.loads(msg.arguments)
-                                sql_query2 = args2.get("query", "")
-                                self.sql_text.delete('1.0', tk.END)
-                                self.sql_text.insert(tk.END, sql_query2)
-                                self.pending_tool_call = msg
-                                return
-                            elif msg.type == "message":
-                                text2 = ''.join(getattr(part, 'text', str(part)) for part in msg.content)
-                                self.chat_history.append({"role": "assistant", "content": text2})
-                                self.append_chat_message("AI", text2)
-                                return
-                        # Fallback
-                        fallback2 = str(response.output)
-                        self.chat_history.append({"role": "assistant", "content": fallback2})
-                        self.append_chat_message("AI", fallback2)
-                    finally:
-                        # Restore chat input after thinking
-                        self.enable_chat_input()
-                threading.Thread(target=continue_ai).start()
-        threading.Thread(target=run).start()
+                # If not a tool call, just re-enable buttons
+                self.set_query_running_state(False)
+
+        threading.Thread(target=run_in_thread).start()
+
+    def continue_ai_conversation(self):
+        """Continues the AI conversation after a tool call output has been processed."""
+        def continue_ai_in_thread():
+            self.set_ai_thinking_state(True)
+            try:
+                schema_string = self.get_latest_schema_string()
+                system_prompt = (
+                    "You are a helpful, high-agency AI assistant for SQL and database questions. "
+                    "The user has approved and executed a SQL query. Use the provided output to inform your next reasoning steps without asking for confirmation again. "
+                    "Suggest additional safe, well-formed SQL queries matching the schema only if needed, and do not request confirmation for already executed actions. "
+                    "Here is the schema for all tables in the database:\n\n" + schema_string
+                )
+                messages_for_ai = [{"role": "system", "content": system_prompt}] + self.chat_history
+
+                response_message = ask_ai_with_tools(messages_for_ai)
+                tool_calls = self.get_tool_calls(response_message)
+                if tool_calls:
+                    self.chat_history.append({"role": "assistant", "tool_calls": [tc.model_dump() if hasattr(tc, 'model_dump') else tc for tc in tool_calls]})
+                    function_call = tool_calls[0]
+                    func = self.get_func(function_call)
+                    if self.get_func_name(func) == "run_sql_query":
+                        func_args = self.get_func_args(func)
+                        args2 = json.loads(func_args if func_args else '{}')
+                        sql_query2 = args2.get("query", "")
+                        self.sql_text.delete('1.0', tk.END)
+                        self.sql_text.insert(tk.END, sql_query2)
+                        self.pending_tool_call = function_call
+                        if sql_query2.strip().lower().startswith("select"):
+                            self.run_sql_query()
+                        else:
+                            self.append_chat_message("AI", f"I've generated a new query for you to review and run:\n```sql\n{sql_query2}\n```")
+                    else:
+                        self.append_chat_message("AI", f"AI requested an unknown tool: {self.get_func_name(func)}")
+                elif self.get_content(response_message):
+                    text2 = self.get_content(response_message)
+                    self.chat_history.append({"role": "assistant", "content": text2})
+                    self.append_chat_message("AI", text2)
+                else:
+                    fallback2 = "AI did not provide a clear response or tool call."
+                    self.chat_history.append({"role": "assistant", "content": fallback2})
+                    self.append_chat_message("AI", fallback2)
+            finally:
+                self.set_ai_thinking_state(False)
+                self.set_query_running_state(False) # Ensure query buttons are re-enabled after full AI turn
+        threading.Thread(target=continue_ai_in_thread).start()
 
     def send_chat(self, event=None):
         """Send a message to the AI chat and display the response, supporting tool calls."""
-        user_msg = self.chat_entry.get().strip()
+        if self.is_ai_thinking:
+            return 'break'
+
+        user_msg = self.chat_entry.get('1.0', tk.END).strip()
         if not user_msg:
-            return
-        # Disable input while AI is thinking
-        self.send_btn.config(text="Thinking...", state='disabled')
-        self.chat_entry.config(state='disabled')
+            return 'break'
+
+        self.set_ai_thinking_state(True)
         self.chat_history.append({"role": "user", "content": user_msg})
         self.append_chat_message("You", user_msg)
-        self.chat_entry.delete(0, tk.END)
-        def ask():
+        self.chat_entry.delete('1.0', tk.END)
+
+        def ask_in_thread():
             try:
-                schema_string = ""
-                for table_name, columns in self.tables.items():
-                    schema_string += f"Table: {table_name}\n"
-                    for col in columns:
-                        schema_string += f" - {col}\n"
-                    schema_string += "\n"
+                schema_string = self.get_latest_schema_string()
                 system_prompt = (
                     "You are a high-agency expert at SQL and databases and your job is a world-class, seasoned senior developer and now assistant for SQL and database questions for the user. You may also be asked to make changes to the database, you should be assertive and lead the user with a action plan while considering the users wants and requirements, which they may not make clear. First, review the user's request and outline a clear multi-step plan in natural language. "
                     "For read-only (SELECT) queries, execute them automatically without asking for individual confirmation. "
@@ -369,60 +513,94 @@ class DBViewerGUI(tk.Tk):
                     "Use only safe, well-formed SQL that matches the provided schema. "
                     "Here is the database schema:\n\n" + schema_string
                 )
-                messages = [
-                    {"role": "system", "content": system_prompt}
-                ] + self.chat_history
-                response = ask_ai_with_tools(messages, [])
-                
-                # Process all messages in the response
-                message_text = ""
-                function_call = None
-                
-                for msg in response.output:
-                    if msg.type == "function_call":
-                        function_call = msg
-                    elif msg.type == "message":
-                        text = ''.join(getattr(part, 'text', str(part)) for part in msg.content)
-                        message_text += text
-                
-                # Display any message text first
-                if message_text:
-                    self.chat_history.append({"role": "assistant", "content": message_text})
-                    self.append_chat_message("AI", message_text)
-                
-                # Then execute any function call
-                if function_call:
-                    args = json.loads(function_call.arguments)
-                    sql_query = args.get("query", "")
-                    self.sql_text.delete('1.0', tk.END)
-                    self.sql_text.insert(tk.END, sql_query)
-                    self.pending_tool_call = function_call
-                    if sql_query.strip().lower().startswith("select"):
-                        # Auto-execute read-only queries immediately
-                        self.run_sql_query()
-                    # For data-changing queries, user confirmation still required
-                    return
+                messages_for_ai = [{"role": "system", "content": system_prompt}] + self.chat_history
 
+                response_message = ask_ai_with_tools(messages_for_ai)
+                tool_calls = self.get_tool_calls(response_message)
+                if tool_calls:
+                    # Append the assistant's message with tool_calls to history immediately
+                    self.chat_history.append({"role": "assistant", "tool_calls": [tc.model_dump() if hasattr(tc, 'model_dump') else tc for tc in tool_calls]})
 
-                # Only show fallback if no message was processed
-                if not message_text:
-                    fallback = str(response.output)
+                    function_call = tool_calls[0] # Assuming one tool call per response for simplicity
+                    func = self.get_func(function_call)
+                    if self.get_func_name(func) == "run_sql_query":
+                        func_args = self.get_func_args(func)
+                        args = json.loads(func_args if func_args else '{}')
+                        sql_query = args.get("query", "")
+                        self.sql_text.delete('1.0', tk.END)
+                        self.sql_text.insert(tk.END, sql_query)
+                        self.pending_tool_call = function_call # Store the function call object
+                        if sql_query.strip().lower().startswith("select"):
+                            # Auto-execute read-only queries. This will trigger the _execute_sql_and_handle_tool_output logic.
+                            self.run_sql_query()
+                        else:
+                            self.append_chat_message("AI", f"I've generated a query for you to review and run:\n```sql\n{sql_query}\n```")
+                    else:
+                        self.append_chat_message("AI", f"AI requested an unknown tool: {self.get_func_name(func)}")
+                elif self.get_content(response_message):
+                    # If no tool call, just append the content message
+                    text = self.get_content(response_message)
+                    self.chat_history.append({"role": "assistant", "content": text})
+                    self.append_chat_message("AI", text)
+                else: # Fallback if no message content and no tool call
+                    fallback = "AI did not provide a clear response."
                     self.chat_history.append({"role": "assistant", "content": fallback})
                     self.append_chat_message("AI", fallback)
             finally:
-                # Re-enable input and clear entry
-                self.send_btn.config(text="Send", state='normal')
-                self.chat_entry.config(state='normal')
-                self.chat_entry.delete(0, tk.END)  # Clear the chat entry after AI response
-                self.chat_entry.focus_set()        # Focus back to input
-        threading.Thread(target=ask).start()
+                self.set_ai_thinking_state(False)
+        threading.Thread(target=ask_in_thread).start()
+        return 'break'
+
+    def use_ai_for_query(self):
+        """Generate a SQL query using AI based on the editor's text."""
+        if self.is_ai_thinking:
+            return # Prevent multiple AI calls
+
+        prompt = self.sql_text.get('1.0', tk.END).strip()
+        if not prompt:
+            messagebox.showinfo("AI SQL Generator", "Please enter your request in the SQL editor area.")
+            return
+
+        self.set_ai_thinking_state(True) # Disable chat input and show thinking
+
+        schema_string = self.get_latest_schema_string()
+        messages = [
+            {"role": "system", "content": f"You are a helpful AI assistant that generates SQL queries based on user requests (which may be very vague, but you must try your best!). Only output the completed SQL prompt, nothing else, DO NOT USE BACKTICKS!. For reference here is the database's entire schema for every table, you may want to infer the desire of the user's request based on the context given here:\n\n{schema_string}"},
+            {"role": "user", "content": prompt}
+        ]
+        # Patch: fix NoneType for query in use_ai_for_query
+        def ai_generate():
+            try:
+                query = ask_ai(messages)
+                if query is None:
+                    query = ''
+                self.sql_text.delete('1.0', tk.END)
+                self.sql_text.insert(tk.END, query)
+            finally:
+                self.set_ai_thinking_state(False) # Re-enable chat input
+
+        threading.Thread(target=ai_generate).start()
 
     def append_chat_message(self, sender, message):
-        """Append a message to the chat display."""
+        """Append a message to the chat display with distinct styling."""
         self.chat_display.config(state='normal')
-        self.chat_display.insert(tk.END, f"{sender}: {message}\n\n")
+        if sender == "You":
+            self.chat_display.insert(tk.END, f"{sender}:\n", "user")
+            self.chat_display.insert(tk.END, f"{message}\n\n", "user")
+        elif sender == "AI":
+            self.chat_display.insert(tk.END, f"{sender}:\n", "ai")
+            self.chat_display.insert(tk.END, f"{message}\n\n", "ai")
+        else:
+            self.chat_display.insert(tk.END, f"{sender}: {message}\n\n")
+        # Add a separator line
+        self.chat_display.insert(tk.END, "----------------------------------------\n\n", "separator")
         self.chat_display.config(state='disabled')
         self.chat_display.see(tk.END)
+
+    def confirm_clear_chat(self):
+        """Asks for confirmation before clearing the chat history."""
+        if messagebox.askyesno("Clear Chat", "Are you sure you want to clear the AI chat history?"):
+            self.clear_chat()
 
     def clear_chat(self):
         """Clear the chat history and display."""
@@ -431,7 +609,33 @@ class DBViewerGUI(tk.Tk):
         self.chat_display.delete('1.0', tk.END)
         self.chat_display.config(state='disabled')
 
+    def sql_history_up(self, event=None):
+        """Cycle up through SQL history."""
+        if not self.sql_history:
+            return 'break'
+        if self.sql_history_index is None:
+            self.sql_history_index = len(self.sql_history) - 1
+        elif self.sql_history_index > 0:
+            self.sql_history_index -= 1
+        self.sql_text.delete('1.0', tk.END)
+        self.sql_text.insert(tk.END, self.sql_history[self.sql_history_index])
+        return 'break'
+
+    def sql_history_down(self, event=None):
+        """Cycle down through SQL history."""
+        if self.sql_history_index is None:
+            return 'break'
+        if self.sql_history_index < len(self.sql_history) - 1:
+            self.sql_history_index += 1
+            self.sql_text.delete('1.0', tk.END)
+            self.sql_text.insert(tk.END, self.sql_history[self.sql_history_index])
+        else:
+            self.sql_text.delete('1.0', tk.END)
+            self.sql_history_index = None
+        return 'break'
+
     def on_tree_select(self, event):
+        """Handles selection of a cell in the result treeview."""
         # Remove previous highlight
         if self.selected_item is not None:
             self.result_tree.item(self.selected_item, tags=())
@@ -472,67 +676,42 @@ class DBViewerGUI(tk.Tk):
         self.run_sql_query()
         return 'break'
 
-    def sql_history_up(self, event=None):
-        """Cycle up through SQL history."""
-        if not self.sql_history:
-            return 'break'
-        if self.sql_history_index is None:
-            self.sql_history_index = len(self.sql_history) - 1
-        elif self.sql_history_index > 0:
-            self.sql_history_index -= 1
-        self.sql_text.delete('1.0', tk.END)
-        self.sql_text.insert(tk.END, self.sql_history[self.sql_history_index])
-        return 'break'
 
-    def sql_history_down(self, event=None):
-        """Cycle down through SQL history."""
-        if self.sql_history_index is None:
-            return 'break'
-        if self.sql_history_index < len(self.sql_history) - 1:
-            self.sql_history_index += 1
-            self.sql_text.delete('1.0', tk.END)
-            self.sql_text.insert(tk.END, self.sql_history[self.sql_history_index])
-        else:
-            self.sql_text.delete('1.0', tk.END)
-            self.sql_history_index = None
-        return 'break'
+# --- OpenAI response helper methods (class scope) ---
+    def get_tool_calls(self, resp):
+        if hasattr(resp, 'tool_calls'):
+            return resp.tool_calls
+        if isinstance(resp, dict) and 'tool_calls' in resp:
+            return resp['tool_calls']
+        return None
 
-    def use_ai_for_query(self):
-        """Generate a SQL query using AI based on the editor's text."""
-        prompt = self.sql_text.get('1.0', tk.END).strip()
-        if not prompt:
-            messagebox.showinfo("AI SQL Generator", "Please enter your request in the SQL editor area.")
-            return
-        schema_string = ""
-        for table_name, columns in self.tables.items():
-            schema_string += f"Table: {table_name}\n"
-            for col in columns:
-                schema_string += f" - {col}\n"
-            schema_string += "\n"
-        messages = [
-            {"role": "system", "content": f"You are a helpful AI assistant that generates SQL queries based on user requests (which may be very vague, but you must try your best!). Only output the completed SQL prompt, nothing else, DO NOT USE BACKTICKS!. For reference here is the database's entire schema for every table, you may want to infer the desire of the user's request based on the context given here:\n\n{schema_string}"},
-            {"role": "user", "content": prompt}
-        ]
-        def ai_generate():
-            query = ask_ai(messages)
-            self.sql_text.delete('1.0', tk.END)
-            self.sql_text.insert(tk.END, query)
-        threading.Thread(target=ai_generate).start()
+    def get_content(self, resp):
+        if hasattr(resp, 'content'):
+            return resp.content
+        if isinstance(resp, dict) and 'content' in resp:
+            return resp['content']
+        return None
 
-    def disable_chat_input(self):
-        """Disable the chat input and send button, show thinking cursor."""
-        self.chat_entry.config(state='disabled')
-        self.send_btn.config(state='disabled')
-        self.chat_entry.delete(0, tk.END)  # Clear the chat entry
-        self.chat_entry.insert(0, "Thinking...")
-        self.chat_entry.icursor(tk.END)
+    def get_func(self, function_call):
+        if hasattr(function_call, 'function'):
+            return function_call.function
+        elif isinstance(function_call, dict) and 'function' in function_call:
+            return function_call['function']
+        return None
 
-    def enable_chat_input(self):
-        """Enable the chat input and send button."""
-        self.chat_entry.config(state='normal')
-        self.send_btn.config(state='normal')
-        self.chat_entry.delete(0, tk.END)  # Clear the chat entry
-        self.chat_entry.focus_set()        # Focus back to input
+    def get_func_name(self, func):
+        if hasattr(func, 'name'):
+            return func.name
+        elif isinstance(func, dict) and 'name' in func:
+            return func['name']
+        return None
+
+    def get_func_args(self, func):
+        if hasattr(func, 'arguments'):
+            return func.arguments
+        elif isinstance(func, dict) and 'arguments' in func:
+            return func['arguments']
+        return None
 
 if __name__ == "__main__":
     app = DBViewerGUI()
