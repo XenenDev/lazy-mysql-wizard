@@ -370,7 +370,7 @@ class DBViewerGUI(tk.Tk):
         Executes a SQL query and handles potential tool output for AI continuation.
         This function is intended to be called synchronously within a thread.
         """
-        columns, result = run_query(query) # Synchronous DB call
+        columns, result = run_query(query)  # Synchronous DB call
 
         # If DDL, refresh schema
         if query.strip().split()[0].lower() in {"create", "drop", "alter", "rename"}:
@@ -381,6 +381,7 @@ class DBViewerGUI(tk.Tk):
 
         # If this execution was triggered by an AI tool call, prepare and append tool output
         if tool_call_obj:
+            # append the "tool" message expected by the API, answering the tool_call_id
             tool_output_msg = {
                 "role": "tool",
                 "tool_call_id": tool_call_obj.id,
@@ -391,9 +392,9 @@ class DBViewerGUI(tk.Tk):
                 }, default=str)
             }
             self.chat_history.append(tool_output_msg)
-            return True # Indicate that tool output was handled
-        return False # Indicate no tool output handling was done
-
+            return True  # Indicate that tool output was handled
+        return False  # Indicate no tool output handling was done
+    
     def _update_result_tree(self, columns, result):
         """Helper to update the result treeview on the main thread."""
         self.result_tree.delete(*self.result_tree.get_children())
@@ -407,7 +408,6 @@ class DBViewerGUI(tk.Tk):
         else:
             msg = result if isinstance(result, str) else str(result)
             messagebox.showinfo("Query Result", msg)
-
 
     def run_sql_query(self):
         """Run the SQL query in the editor and display results."""
@@ -424,21 +424,19 @@ class DBViewerGUI(tk.Tk):
             self.sql_history.append(query)
         self.sql_history_index = None
 
-        # Execute in a new thread to keep GUI responsive
         def run_in_thread():
-            # If there's a pending tool call, it means this run was triggered by AI.
-            # We need to pass the pending_tool_call to the synchronous executor.
+            # Capture any pending tool call (from AI) and clear it
             current_pending_tool_call = self.pending_tool_call
-            self.pending_tool_call = None # Clear it immediately
+            self.pending_tool_call = None
 
             tool_output_handled = self._execute_sql_and_handle_tool_output(query, current_pending_tool_call)
 
             if tool_output_handled:
-                # If tool output was handled, continue AI conversation
+                # Continue the AI conversation now that the tool output has been appended
                 self.continue_ai_conversation()
             else:
-                # If not a tool call, just re-enable buttons
-                self.set_query_running_state(False)
+                # No tool involved, simply re-enable buttons
+                self.after(0, lambda: self.set_query_running_state(False))
 
         threading.Thread(target=run_in_thread).start()
 
@@ -459,22 +457,23 @@ class DBViewerGUI(tk.Tk):
                 response_message = ask_ai_with_tools(messages_for_ai)
                 tool_calls = self.get_tool_calls(response_message)
                 if tool_calls:
-                    self.chat_history.append({"role": "assistant", "tool_calls": [tc.model_dump() if hasattr(tc, 'model_dump') else tc for tc in tool_calls]})
-                    function_call = tool_calls[0]
-                    func = self.get_func(function_call)
-                    if self.get_func_name(func) == "run_sql_query":
-                        func_args = self.get_func_args(func)
-                        args2 = json.loads(func_args if func_args else '{}')
-                        sql_query2 = args2.get("query", "")
-                        self.sql_text.delete('1.0', tk.END)
-                        self.sql_text.insert(tk.END, sql_query2)
-                        self.pending_tool_call = function_call
-                        if sql_query2.strip().lower().startswith("select"):
-                            self.run_sql_query()
-                        else:
-                            self.append_chat_message("AI", f"I've generated a new query for you to review and run:\n```sql\n{sql_query2}\n```")
-                    else:
-                        self.append_chat_message("AI", f"AI requested an unknown tool: {self.get_func_name(func)}")
+                    # Assistant message with tool_calls
+                    self.chat_history.append({
+                        "role": "assistant",
+                        "tool_calls": [tc.model_dump() if hasattr(tc, 'model_dump') else tc for tc in tool_calls]
+                    })
+
+                    # **FIX**: immediately follow up with the corresponding "tool" messages
+                    for tc in tool_calls:
+                        func = self.get_func(tc)
+                        func_name = self.get_func_name(func)
+                        func_args = json.loads(self.get_func_args(func) or "{}")
+                        if func_name == "run_sql_query":
+                            sql = func_args.get("query", "")
+                            # execute the tool
+                            self._execute_sql_and_handle_tool_output(sql, tc)
+
+                    # no further re-enabling here; continue_ai_conversation will handle it
                 elif self.get_content(response_message):
                     text2 = self.get_content(response_message)
                     self.chat_history.append({"role": "assistant", "content": text2})
@@ -485,7 +484,7 @@ class DBViewerGUI(tk.Tk):
                     self.append_chat_message("AI", fallback2)
             finally:
                 self.set_ai_thinking_state(False)
-                self.set_query_running_state(False) # Ensure query buttons are re-enabled after full AI turn
+                self.set_query_running_state(False)
         threading.Thread(target=continue_ai_in_thread).start()
 
     def send_chat(self, event=None):
@@ -518,36 +517,38 @@ class DBViewerGUI(tk.Tk):
                 response_message = ask_ai_with_tools(messages_for_ai)
                 tool_calls = self.get_tool_calls(response_message)
                 if tool_calls:
-                    # Append the assistant's message with tool_calls to history immediately
-                    self.chat_history.append({"role": "assistant", "tool_calls": [tc.model_dump() if hasattr(tc, 'model_dump') else tc for tc in tool_calls]})
+                    # Assistant message with tool_calls
+                    self.chat_history.append({
+                        "role": "assistant",
+                        "tool_calls": [tc.model_dump() if hasattr(tc, 'model_dump') else tc for tc in tool_calls]
+                    })
 
-                    function_call = tool_calls[0] # Assuming one tool call per response for simplicity
-                    func = self.get_func(function_call)
-                    if self.get_func_name(func) == "run_sql_query":
-                        func_args = self.get_func_args(func)
-                        args = json.loads(func_args if func_args else '{}')
-                        sql_query = args.get("query", "")
-                        self.sql_text.delete('1.0', tk.END)
-                        self.sql_text.insert(tk.END, sql_query)
-                        self.pending_tool_call = function_call # Store the function call object
-                        if sql_query.strip().lower().startswith("select"):
-                            # Auto-execute read-only queries. This will trigger the _execute_sql_and_handle_tool_output logic.
+                    # **FIX**: immediately follow up with each tool execution message
+                    for tc in tool_calls:
+                        func = self.get_func(tc)
+                        func_name = self.get_func_name(func)
+                        func_args = json.loads(self.get_func_args(func) or "{}")
+                        if func_name == "run_sql_query":
+                            sql_query = func_args.get("query", "")
+                            self.sql_text.delete('1.0', tk.END)
+                            self.sql_text.insert(tk.END, sql_query)
+                            self.pending_tool_call = tc
+                            # execute regardless of SELECT vs. modification
                             self.run_sql_query()
                         else:
-                            self.append_chat_message("AI", f"I've generated a query for you to review and run:\n```sql\n{sql_query}\n```")
-                    else:
-                        self.append_chat_message("AI", f"AI requested an unknown tool: {self.get_func_name(func)}")
+                            self.append_chat_message("AI", f"AI requested an unknown tool: {func_name}")
                 elif self.get_content(response_message):
-                    # If no tool call, just append the content message
                     text = self.get_content(response_message)
                     self.chat_history.append({"role": "assistant", "content": text})
                     self.append_chat_message("AI", text)
-                else: # Fallback if no message content and no tool call
+                else:
                     fallback = "AI did not provide a clear response."
                     self.chat_history.append({"role": "assistant", "content": fallback})
                     self.append_chat_message("AI", fallback)
             finally:
-                self.set_ai_thinking_state(False)
+                # Note: run_sql_query / continue_ai_conversation will reset thinking state
+                if not self.is_query_running:
+                    self.set_ai_thinking_state(False)
         threading.Thread(target=ask_in_thread).start()
         return 'break'
 
