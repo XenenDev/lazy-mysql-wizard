@@ -91,13 +91,12 @@ def ask_ai(messages):
         return response.choices[0].message.content
     except Exception as e:
         return f"AI Error: {e}"
-
 def ask_ai_with_tools(messages, tool_outputs=None):
     """
     Uses OpenAI tool-calling API to allow the AI to request running SQL queries.
     If tool_outputs is provided, it should be a list of tool call output messages.
     """
-    tools = [{
+    tools: list[ChatCompletionToolParam] = [{
         "type": "function",
         "function": {
             "name": "run_sql_query",
@@ -111,6 +110,7 @@ def ask_ai_with_tools(messages, tool_outputs=None):
             }
         }
     }]
+    
     input_msgs = messages.copy()
     if tool_outputs:
         input_msgs.extend(tool_outputs)
