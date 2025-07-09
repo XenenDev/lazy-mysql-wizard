@@ -21,6 +21,14 @@ A modern Python Tkinter application for effortless MySQL database management, po
    ```
 2. **Configure database connection**
    - Set your DB credentials in a `.env` file or directly in the script.
+   ```env
+   DB_HOST=your-db-host
+   DB_USER=your-db-user
+   DB_PASSWORD=your-db-password
+   DB_NAME=your-db-name
+   DB_PORT=3306
+   OPENAI_API_KEY=your-openai-api-key
+   ```
 3. **Run the app**
    ```sh
    python db_viewer_gui.py
