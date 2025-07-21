@@ -458,10 +458,10 @@ class DBViewerGUI(tk.Tk):
             }
             if hasattr(response_message, 'tool_calls') and response_message.tool_calls:
                 # Convert tool calls to serializable format
-                assistant_msg["tool_calls"] = [
+                assistant_msg["tool_calls"] = json.dumps([
                     tc.model_dump() if hasattr(tc, 'model_dump') else tc 
                     for tc in response_message.tool_calls
-                ]
+                ])
             self.chat_history.append(assistant_msg)
             self.append_chat_message("AI", response_message.content)
         elif hasattr(response_message, 'tool_calls') and response_message.tool_calls:
@@ -493,7 +493,7 @@ class DBViewerGUI(tk.Tk):
                             self.sql_text.insert(tk.END, sql_query)
                             
                             # Execute query
-                            columns, result = self.run_sql_query(from_ai=True, ai_query=sql_query)
+                            columns, result = self.run_sql_query(from_ai=True, ai_query=sql_query) or ([], [])
                             
                             # Add tool response to chat history
                             tool_response = {
