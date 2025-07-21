@@ -12,7 +12,7 @@ A modern Python Tkinter application for effortless MySQL database management, po
 - **Customizable**: Edit queries before running, and view all AI-generated SQL before execution.
 - **No API Key Required**: AI features are optional; you can use the app as a lightweight DB viewer without OpenAI integration.
 
-![screenshot](https://github.com/user-attachments/assets/b5322851-ec20-4c84-b0fd-26e987c91978)
+<img width="835" height="940" alt="image" src="https://github.com/user-attachments/assets/2794373c-3609-40cb-a8da-d8c58da08c0e" />
 
 ## Setup
 1. **Install dependencies**
