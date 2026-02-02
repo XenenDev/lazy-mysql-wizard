@@ -1,5 +1,7 @@
 # LAZY MYSQL WIZARD 🧙🪄📊
 
+<img height="400" alt="image" src="https://github.com/user-attachments/assets/4ea54d8d-136e-4036-8d10-4018efb48391" />
+
 An intelligent Python Tkinter application for MySQL database management powered by OpenAI's language models. Features an AI agent with configurable autonomy levels for natural language database interactions.
 
 ## Features
