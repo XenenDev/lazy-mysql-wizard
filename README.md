@@ -55,10 +55,10 @@ An intelligent Python Tkinter application for MySQL database management powered 
    DB_NAME=your-db-name
    DB_PORT=3306
    OPENAI_API_KEY=your-openai-api-key
-   OPENAI_MODEL_ID=gpt-4o
+   OPENAI_MODEL_ID=gpt-5.2
    ```
    
-   **Note**: Replace the values with your actual credentials. For `OPENAI_MODEL_ID`, you can use models like `gpt-4o`, `gpt-4-turbo`, or `gpt-3.5-turbo`.
+   **Note**: Replace the values with your actual credentials. For `OPENAI_MODEL_ID`, you can use models like `gpt-5.2`.
 
 4. **Run the application**
    ```sh
