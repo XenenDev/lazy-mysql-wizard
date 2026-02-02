@@ -1,4 +1,4 @@
-# AI Data Agent - MySQL Wizard
+# LAZY MYSQL WIZARD 🧙🪄📊
 
 An intelligent Python Tkinter application for MySQL database management powered by OpenAI's language models. Features an AI agent with configurable autonomy levels for natural language database interactions.
 
