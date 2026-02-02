@@ -28,7 +28,7 @@ DB_CONFIG = {
     'user': os.getenv("DB_USER"),
     'password': os.getenv("DB_PASS"), # Please rotate this password
     'database': os.getenv("DB_NAME"),
-    'port': int(os.getenv("DB_PORT"),
+    'port': int(os.getenv("DB_PORT")),
     'ssl_disabled': False
 }
 
