@@ -32,7 +32,9 @@ DB_CONFIG = {
     'ssl_disabled': False
 }
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_KEY_HERE")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID")
 
 # --- STYLES ---
 COLORS = {
@@ -115,7 +117,7 @@ class Agent:
     def __init__(self, db_manager: DatabaseManager, agency_level: int = 2):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.db = db_manager
-        self.model = "gpt-4o" # Use a capable model for reasoning
+        self.model = OPENAI_MODEL_ID
         self.history = []
         self.agency_level = agency_level
         self.system_prompt = self._get_system_prompt()
