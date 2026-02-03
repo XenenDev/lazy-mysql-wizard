@@ -58,6 +58,8 @@ An intelligent Python Tkinter application for MySQL database management powered 
    DB_PORT=3306
    OPENAI_API_KEY=your-openai-api-key
    OPENAI_MODEL_ID=gpt-5.2
+   TOKEN_INPUT_PRICE_PER_M=1.75
+   TOKEN_OUTPUT_PRICE_PER_M=14
    ```
    
    **Note**: Replace the values with your actual credentials. For `OPENAI_MODEL_ID`, you can use models like `gpt-5.2`.
