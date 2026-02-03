@@ -2,43 +2,42 @@ import os
 import json
 import threading
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, simpledialog, font
+from tkinter import ttk, scrolledtext, messagebox, font
 import mysql.connector
-from mysql.connector import Error
+from mysql.connector import pooling, Error
 from openai import OpenAI
 from dotenv import load_dotenv
 import re
 import ctypes
+import time
 
-# Enable DPI awareness for sharper text on high-DPI displays (Windows)
+# --- WINDOWS DPI AWARENESS ---
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    ctypes.windll.shcore.SetProcessDpiAwareness(2) 
 except:
     try:
-        ctypes.windll.user32.SetProcessDPIAware()  # Fallback for older Windows
+        ctypes.windll.user32.SetProcessDPIAware()
     except:
         pass
 
-# Load environment variables (Create a .env file with these keys)
+# --- CONFIGURATION ---
 load_dotenv()
 
-# --- CONFIGURATION ---
 DB_CONFIG = {
-    'host': os.getenv("DB_HOST"),
-    'user': os.getenv("DB_USER"),
-    'password': os.getenv("DB_PASS"), # Please rotate this password
-    'database': os.getenv("DB_NAME"),
-    'port': int(os.getenv("DB_PORT")),
-    'ssl_disabled': False
+    'host': os.getenv("DB_HOST", "localhost"),
+    'user': os.getenv("DB_USER", "root"),
+    'password': os.getenv("DB_PASS", ""),
+    'database': os.getenv("DB_NAME", ""),
+    'port': int(os.getenv("DB_PORT", 3306)),
+    'ssl_ca': os.getenv("DB_SSL_CA"),        # Path to CA file if needed
+    'ssl_disabled': os.getenv("DB_SSL_DISABLED", "False").lower() == "true"
 }
 
+# Remove None values for SSL keys if not provided
+DB_CONFIG = {k: v for k, v in DB_CONFIG.items() if v is not None}
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID")
-
-# Token pricing (cost per 1M tokens) - optional, set in .env if you want cost tracking
-TOKEN_INPUT_PRICE_PER_M = float(os.getenv("TOKEN_INPUT_PRICE_PER_M")) if os.getenv("TOKEN_INPUT_PRICE_PER_M") else None
-TOKEN_OUTPUT_PRICE_PER_M = float(os.getenv("TOKEN_OUTPUT_PRICE_PER_M")) if os.getenv("TOKEN_OUTPUT_PRICE_PER_M") else None
+OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "gpt-4-turbo")
 
 # --- STYLES ---
 COLORS = {
@@ -51,768 +50,708 @@ COLORS = {
     "chat_user": "#264f78",
     "chat_ai": "#3e3e42",
     "success": "#4ec9b0",
-    "warning": "#ce9178"
+    "warning": "#ce9178",
+    "error": "#f48771"
 }
 
-# --- DATABASE MANAGER ---
+# --- SAFETY VALIDATOR ---
+class SQLValidator:
+    """Parses SQL to determine intent and safety."""
+    
+    DESTRUCTIVE_COMMANDS = {'DELETE', 'DROP', 'TRUNCATE', 'ALTER', 'UPDATE', 'INSERT', 'CREATE', 'GRANT', 'REVOKE'}
+
+    @staticmethod
+    def get_command_type(query):
+        """Extracts the primary command word, ignoring comments."""
+        # Remove -- comments
+        query = re.sub(r'--.*', '', query)
+        # Remove /* */ comments
+        query = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
+        
+        # Normalize whitespace
+        tokens = query.strip().split()
+        if not tokens:
+            return None
+        
+        return tokens[0].upper()
+
+    @staticmethod
+    def is_safe_read_only(query):
+        cmd = SQLValidator.get_command_type(query)
+        if cmd in SQLValidator.DESTRUCTIVE_COMMANDS:
+            return False, cmd
+        return True, cmd
+
+# --- DATABASE MANAGER (POOLED) ---
 class DatabaseManager:
     def __init__(self, config):
         self.config = config
-        self.schema_cache = ""
-
-    def connect(self):
-        try:
-            # Handle SSL requirement logic if needed
-            return mysql.connector.connect(**self.config)
-        except Error as e:
-            return None
-
-    def get_schema_summary(self):
-        """Fetches comprehensive database schema information to give the AI context."""
-        conn = self.connect()
-        if not conn:
-            return "Error: Could not connect to database."
+        self.pool = None
+        self.schema_summary = "" # Only table names
         
-        schema_str = "=== DATABASE INFORMATION ===\n"
+    def connect_pool(self):
+        """Initializes the connection pool in a thread-safe way."""
+        try:
+            self.pool = mysql.connector.pooling.MySQLConnectionPool(
+                pool_name="mypool",
+                pool_size=5,
+                **self.config
+            )
+            return True, "Connected successfully."
+        except Error as e:
+            return False, str(e)
+
+    def get_connection(self):
+        if not self.pool:
+            return None
+        return self.pool.get_connection()
+
+    def get_table_names(self):
+        """Fetches ONLY table names for the initial context."""
+        conn = self.get_connection()
+        if not conn: return "Error: No DB connection."
+        
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SHOW TABLES")
+            tables = [r[0] for r in cursor.fetchall()]
+            conn.close()
+            
+            self.schema_summary = "Available Tables:\n" + "\n".join([f"- {t}" for t in tables])
+            return self.schema_summary
+        except Error as e:
+            if conn: conn.close()
+            return f"Error fetching tables: {e}"
+
+    def get_table_details(self, table_name):
+        """Fetches detailed schema for a specific table (Lazy Loading)."""
+        conn = self.get_connection()
+        if not conn: return "Error: No DB connection."
+        
+        output = f"=== SCHEMA FOR {table_name} ===\n"
         try:
             cursor = conn.cursor()
             
-            # Get MySQL version
-            cursor.execute("SELECT VERSION()")
-            version = cursor.fetchone()[0]
-            schema_str += f"MySQL Version: {version}\n"
-            
-            # Get database name and default character set/collation
-            cursor.execute("SELECT DATABASE()")
-            db_name = cursor.fetchone()[0]
-            cursor.execute(f"SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{db_name}'")
-            charset_info = cursor.fetchone()
-            if charset_info:
-                schema_str += f"Database: {db_name}\n"
-                schema_str += f"Default Character Set: {charset_info[0]}\n"
-                schema_str += f"Default Collation: {charset_info[1]}\n"
-            
-            schema_str += "\n=== TABLES ===\n"
-            
-            # Get all tables
-            cursor.execute("SHOW TABLES")
-            tables = cursor.fetchall()
-            
-            for (table_name,) in tables:
-                schema_str += f"\n--- Table: {table_name} ---\n"
+            # Columns
+            cursor.execute(f"DESCRIBE {table_name}")
+            columns = cursor.fetchall()
+            output += "Columns:\n"
+            for col in columns:
+                output += f"  - {col[0]} ({col[1]}) key={col[3]} null={col[2]}\n"
                 
-                # Get table metadata (engine, collation, auto_increment, etc.)
-                cursor.execute(f"""
-                    SELECT ENGINE, TABLE_COLLATION, AUTO_INCREMENT, TABLE_ROWS, 
-                           AVG_ROW_LENGTH, DATA_LENGTH, CREATE_TIME, UPDATE_TIME
-                    FROM information_schema.TABLES 
-                    WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}'
-                """)
-                table_info = cursor.fetchone()
-                if table_info:
-                    schema_str += f"  Engine: {table_info[0]}\n"
-                    schema_str += f"  Collation: {table_info[1]}\n"
-                    if table_info[2]:
-                        schema_str += f"  Auto Increment: {table_info[2]}\n"
-                    schema_str += f"  Approx Rows: {table_info[3]}\n"
-                
-                # Get detailed column information
-                cursor.execute(f"DESCRIBE {table_name}")
-                columns = cursor.fetchall()
-                schema_str += "  Columns:\n"
-                for col in columns:
-                    col_name, col_type, nullable, key, default, extra = col
-                    col_desc = f"    - {col_name} ({col_type})"
-                    if key == 'PRI':
-                        col_desc += " PRIMARY KEY"
-                    if key == 'MUL':
-                        col_desc += " INDEXED"
-                    if key == 'UNI':
-                        col_desc += " UNIQUE"
-                    if nullable == 'NO':
-                        col_desc += " NOT NULL"
-                    if default is not None:
-                        col_desc += f" DEFAULT {default}"
-                    if extra:
-                        col_desc += f" {extra}"
-                    schema_str += col_desc + "\n"
-                
-                # Get indexes
-                cursor.execute(f"SHOW INDEX FROM {table_name}")
-                indexes = cursor.fetchall()
-                if indexes:
-                    index_dict = {}
-                    for idx in indexes:
-                        idx_name = idx[2]
-                        col_name = idx[4]
-                        if idx_name not in index_dict:
-                            index_dict[idx_name] = []
-                        index_dict[idx_name].append(col_name)
-                    
-                    schema_str += "  Indexes:\n"
-                    for idx_name, cols in index_dict.items():
-                        if idx_name != 'PRIMARY':
-                            schema_str += f"    - {idx_name} ({', '.join(cols)})\n"
-                
-                # Get foreign keys
-                cursor.execute(f"""
-                    SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
-                    FROM information_schema.KEY_COLUMN_USAGE
-                    WHERE TABLE_SCHEMA = '{db_name}' 
-                    AND TABLE_NAME = '{table_name}'
-                    AND REFERENCED_TABLE_NAME IS NOT NULL
-                """)
-                foreign_keys = cursor.fetchall()
-                if foreign_keys:
-                    schema_str += "  Foreign Keys:\n"
-                    for fk in foreign_keys:
-                        schema_str += f"    - {fk[1]} -> {fk[2]}.{fk[3]}\n"
-            
+            # Indexes (Simplified)
+            cursor.execute(f"SHOW INDEX FROM {table_name}")
+            indexes = cursor.fetchall()
+            if indexes:
+                output += "Indexes:\n"
+                seen_idx = set()
+                for idx in indexes:
+                    idx_name = idx[2]
+                    col_name = idx[4]
+                    if idx_name not in seen_idx:
+                        output += f"  - {idx_name} (starts with {col_name})\n"
+                        seen_idx.add(idx_name)
+
             conn.close()
-            self.schema_cache = schema_str
-            return schema_str
+            return output
         except Error as e:
-            return f"Error getting schema: {e}"
+            if conn: conn.close()
+            return f"Error fetching details for {table_name}: {e}"
 
     def execute_query(self, query):
-        """Executes a query and returns (columns, rows, error_message)."""
-        conn = self.connect()
-        if not conn:
-            return None, None, "Connection failed."
+        conn = self.get_connection()
+        if not conn: return None, None, "No connection."
         
         try:
             cursor = conn.cursor()
             cursor.execute(query)
             
             if cursor.description:
-                # SELECT statement
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
                 conn.close()
                 return columns, rows, None
             else:
-                # INSERT/UPDATE/DELETE/DDL
                 conn.commit()
                 affected = cursor.rowcount
                 conn.close()
-                return ["Message"], [[f"Success. Rows affected: {affected}"]], None
+                return ["Info"], [[f"Rows affected: {affected}"]], None
         except Error as e:
             if conn: conn.close()
             return None, None, str(e)
 
-# --- AI AGENT ---
+# --- AGENT (Context Optimized) ---
 class Agent:
-    def __init__(self, db_manager: DatabaseManager, agency_level: int = 2):
+    def __init__(self, db_manager: DatabaseManager):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.db = db_manager
         self.model = OPENAI_MODEL_ID
         self.history = []
-        self.agency_level = agency_level
-        self.system_prompt = self._get_system_prompt()
-        # Token tracking
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
-        # Initialize history with schema context
-        self.refresh_context()
-    
-    def _get_system_prompt(self):
-        """Generate system prompt based on agency level."""
-        base = (
-            "You are an expert Database Reliability Engineer and Data Analyst agent. "
-            "Your goal is to assist the user with SQL queries and data analysis.\n"
-            "GUIDELINES:\n"
-            "1. **Context**: Remember previous questions.\n"
-            "2. **Safety**: You have read/write access. Be careful. "
-            "3. **Clarification**: If a request is ambiguous (e.g., 'fix the data'), do NOT guess. "
-            "Call the `ask_user_clarification` tool.\n"
-            "4. **Schema Awareness**: Use the provided schema to write accurate SQL.\n"
-        )
+        self.agency_level = 2
         
-        if self.agency_level == 1:
-            return base + (
-                "5. **AGENCY LEVEL 1 - Draft Only**: DO NOT execute queries automatically. "
-                "Your role is to DRAFT SQL queries and explain them, but let the user run them manually. "
-                "Only use `ask_user_clarification` tool when needed. Do NOT call `run_sql_query`.\n"
-            )
-        elif self.agency_level == 2:
-            return base + (
-                "5. **AGENCY LEVEL 2 - Moderate Autonomy**: Execute simple SELECT queries (1-2 steps). "
-                "For complex investigations requiring multiple queries, draft the queries and ask user permission first. "
-                "Be conservative and clarify when in doubt.\n"
-            )
-        else:  # Level 3
-            return base + (
-                "5. **AGENCY LEVEL 3 - Full Autonomy**: Conduct comprehensive investigations. "
-                "Execute multiple queries as needed to fully answer user questions. "
-                "Search through tables, analyze patterns, and provide detailed insights. "
-                "Be proactive and thorough in your analysis.\n"
-            )
-    
-    def set_agency_level(self, level: int):
-        """Change the agency level and refresh context."""
-        self.agency_level = level
-        self.system_prompt = self._get_system_prompt()
-        self.refresh_context()
+        # Token Tracking
+        self.tokens_in = 0
+        self.tokens_out = 0
 
     def refresh_context(self):
-        schema = self.db.get_schema_summary()
-        self.history = [
-            {"role": "system", "content": f"{self.system_prompt}\n\n{schema}"}
-        ]
+        """Rebuilds system prompt with minimal schema."""
+        table_list = self.db.schema_summary or "Tables not loaded yet."
+        
+        system_prompt = (
+            "You are a SQL Database Expert. \n"
+            "GUIDELINES:\n"
+            "1. **Lazy Loading**: You have the list of tables below. You DO NOT know column names yet. "
+            "If you need to write a query, first use `get_table_details` to see the columns, THEN write the SQL.\n"
+            "2. **Safety**: Do not guess column names. Verify them.\n"
+            f"\n{table_list}"
+        )
+        self.history = [{"role": "system", "content": system_prompt}]
 
-    def chat(self, user_input, tool_handler_callback):
-        """
-        Main chat loop. 
-        tool_handler_callback: function(tool_name, args) -> result
-        """
+    def trim_history(self):
+        """Prevents context window explosion."""
+        MAX_HISTORY = 12 # Keep system prompt + last 11 messages
+        if len(self.history) > MAX_HISTORY:
+            # Keep system prompt (index 0) and the recent messages
+            self.history = [self.history[0]] + self.history[-(MAX_HISTORY-1):]
+
+    def chat(self, user_input, tool_handler, stream_callback):
+        self.trim_history()
         self.history.append({"role": "user", "content": user_input})
 
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_sql_query",
+                    "description": "Execute a SQL query. Ensure you have checked table schema first.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Valid MySQL query."}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_table_details",
+                    "description": "Get column definitions and keys for a specific table.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "table_name": {"type": "string"}
+                        },
+                        "required": ["table_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ask_user_clarification",
+                    "description": "Ask user for details if request is ambiguous.",
+                    "parameters": {"type": "object", "properties": {"question": {"type": "string"}}}
+                }
+            }
+        ]
+
         try:
-            # 1. First API Call (Thinking/Tool Selection)
+            # 1. First Call
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=self.history,
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "run_sql_query",
-                            "description": "Execute a SQL query against the database.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {"type": "string", "description": "Valid MySQL query."}
-                                },
-                                "required": ["query"]
-                            }
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "ask_user_clarification",
-                            "description": "Ask the user for more details if the request is ambiguous.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "question": {"type": "string", "description": "The question to ask the user."}
-                                },
-                                "required": ["question"]
-                            }
-                        }
-                    }
-                ],
-                tool_choice="auto"
+                tools=tools,
+                tool_choice="auto",
+                stream=True,
+                stream_options={"include_usage": True}
             )
             
-            # Track token usage
-            if hasattr(response, 'usage') and response.usage:
-                self.total_input_tokens += response.usage.prompt_tokens
-                self.total_output_tokens += response.usage.completion_tokens
+            full_content = ""
+            tool_calls = []
             
-            message = response.choices[0].message
-            self.history.append(message)
+            for chunk in response:
+                if chunk.usage: 
+                    self.tokens_in += chunk.usage.prompt_tokens
+                    self.tokens_out += chunk.usage.completion_tokens
+                
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta:
+                    if delta.content:
+                        full_content += delta.content
+                        stream_callback(delta.content)
+                    
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            while len(tool_calls) <= idx:
+                                tool_calls.append({'id': '', 'func': {'name': '', 'args': ''}})
+                            if tc.id: tool_calls[idx]['id'] = tc.id
+                            if tc.function.name: tool_calls[idx]['func']['name'] = tc.function.name
+                            if tc.function.arguments: tool_calls[idx]['func']['args'] += tc.function.arguments
 
-            # 2. Check for Tool Calls
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    func_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
+            # 2. Process Tools
+            if tool_calls:
+                self.history.append({"role": "assistant", "content": full_content, 
+                                     "tool_calls": [{"id": t['id'], "type": "function", 
+                                                     "function": {"name": t['func']['name'], "arguments": t['func']['args']}} for t in tool_calls]})
+                
+                for tc in tool_calls:
+                    name = tc['func']['name']
+                    args = json.loads(tc['func']['args'])
+                    result = tool_handler(name, args) # Call back to UI
                     
-                    # Execute tool via callback (allows UI interception)
-                    tool_result = tool_handler_callback(func_name, args)
-                    
-                    # Append tool result to history
                     self.history.append({
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": str(tool_result)
+                        "tool_call_id": tc['id'],
+                        "content": str(result)
                     })
 
-                # 3. Follow-up API Call (Interpret Results)
-                final_response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.history
+                # 3. Final Answer (Streamed)
+                follow_up = self.client.chat.completions.create(
+                    model=self.model, messages=self.history, stream=True, stream_options={"include_usage": True}
                 )
                 
-                # Track token usage
-                if hasattr(final_response, 'usage') and final_response.usage:
-                    self.total_input_tokens += final_response.usage.prompt_tokens
-                    self.total_output_tokens += final_response.usage.completion_tokens
+                final_text = ""
+                for chunk in follow_up:
+                    if chunk.usage: 
+                        self.tokens_in += chunk.usage.prompt_tokens
+                        self.tokens_out += chunk.usage.completion_tokens
+                        
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.content:
+                        final_text += delta.content
+                        stream_callback(delta.content)
                 
-                final_msg = final_response.choices[0].message
-                self.history.append(final_msg)
-                return final_msg.content
+                self.history.append({"role": "assistant", "content": final_text})
+                return final_text
             
             else:
-                return message.content
+                self.history.append({"role": "assistant", "content": full_content})
+                return full_content
 
         except Exception as e:
-            return f"Agent Error: {str(e)}"
+            return f"API Error: {e}"
 
 # --- MARKDOWN RENDERER ---
 class MarkdownRenderer:
-    """Renders markdown text into tkinter Text widget with tags."""
+    @staticmethod
+    def render(text_widget, text, tag="ai"):
+        try:
+            lines = text.split('\n')
+            in_code_block = False
+            
+            for line in lines:
+                # Code blocks
+                if line.strip().startswith('```'):
+                    in_code_block = not in_code_block
+                    text_widget.insert(tk.END, line + "\n", "code_block")
+                    continue
+                
+                if in_code_block:
+                    text_widget.insert(tk.END, line + "\n", "code_block")
+                    continue
+                
+                # Headers
+                header_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+                if header_match:
+                    level = len(header_match.group(1))
+                    header_text = header_match.group(2)
+                    header_tag = f"h{level}"
+                    MarkdownRenderer._parse_inline(text_widget, header_text, header_tag)
+                    text_widget.insert(tk.END, "\n")
+                    continue
+                
+                # Blockquotes
+                if line.strip().startswith('>'):
+                    quote_text = line.strip()[1:].strip()
+                    text_widget.insert(tk.END, "❝ ", "blockquote")
+                    MarkdownRenderer._parse_inline(text_widget, quote_text, "blockquote")
+                    text_widget.insert(tk.END, "\n")
+                    continue
+                
+                # Horizontal rule
+                if re.match(r'^(---|\*\*\*|___)$', line.strip()):
+                    text_widget.insert(tk.END, "―" * 50 + "\n", "hr")
+                    continue
+                
+                # Unordered lists
+                list_match = re.match(r'^[\s]*([-*+])\s+(.+)$', line)
+                if list_match:
+                    indent = len(line) - len(line.lstrip())
+                    bullet = "  " * (indent // 2) + "• "
+                    text_widget.insert(tk.END, bullet, "list")
+                    MarkdownRenderer._parse_inline(text_widget, list_match.group(2), tag)
+                    text_widget.insert(tk.END, "\n")
+                    continue
+                
+                # Ordered lists
+                ordered_match = re.match(r'^[\s]*(\d+)\.\.?\s+(.+)$', line)
+                if ordered_match:
+                    indent = len(line) - len(line.lstrip())
+                    number = "  " * (indent // 2) + ordered_match.group(1) + ". "
+                    text_widget.insert(tk.END, number, "list")
+                    MarkdownRenderer._parse_inline(text_widget, ordered_match.group(2), tag)
+                    text_widget.insert(tk.END, "\n")
+                    continue
+                
+                # Regular text with inline formatting
+                MarkdownRenderer._parse_inline(text_widget, line, tag)
+                text_widget.insert(tk.END, "\n")
+                
+        except Exception as e:
+            text_widget.insert(tk.END, text + "\n", tag)
     
     @staticmethod
-    def render(text_widget, markdown_text, base_tag="ai"):
-        """Parse and render markdown text with formatting."""
-        lines = markdown_text.split('\n')
-        i = 0
+    def _parse_inline(text_widget, text, base_tag="ai"):
+        """Parse inline markdown: bold, italic, inline code, links"""
+        # Pattern for inline elements: bold, italic, code, links
+        pattern = r'(\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_|`[^`]+`|\[([^\]]+)\]\(([^)]+)\)|~~[^~]+~~)'
         
-        while i < len(lines):
-            line = lines[i]
-            
-            # Check for table
-            if '|' in line and i + 1 < len(lines) and '|' in lines[i + 1]:
-                i = MarkdownRenderer._render_table(text_widget, lines, i)
+        parts = re.split(pattern, text)
+        
+        for i, part in enumerate(parts):
+            if not part:
                 continue
-            
-            # Headers
-            if line.startswith('#'):
-                level = len(line) - len(line.lstrip('#'))
-                text = line.lstrip('#').strip()
-                text_widget.insert(tk.END, text + '\n', f"header{level}")
-            # Code blocks
-            elif line.startswith('```'):
-                i, code_block = MarkdownRenderer._extract_code_block(lines, i)
-                text_widget.insert(tk.END, code_block + '\n', "code_block")
-            # Bullet points
-            elif line.strip().startswith(('- ', '* ', '+ ')):
-                text = line.strip()[2:]
-                text_widget.insert(tk.END, '  • ', base_tag)
-                MarkdownRenderer._render_inline(text_widget, text, base_tag)
-                text_widget.insert(tk.END, '\n', base_tag)
-            # Numbered lists
-            elif re.match(r'^\d+\.\s', line.strip()):
-                MarkdownRenderer._render_inline(text_widget, line.strip(), base_tag)
-                text_widget.insert(tk.END, '\n', base_tag)
+                
+            # Bold + Italic (***text***)
+            if part.startswith('***') and part.endswith('***') and len(part) > 6:
+                text_widget.insert(tk.END, part[3:-3], "bold_italic")
+            # Bold (**text**)
+            elif part.startswith('**') and part.endswith('**') and len(part) > 4:
+                text_widget.insert(tk.END, part[2:-2], "bold")
+            # Italic (*text* or _text_)
+            elif (part.startswith('*') and part.endswith('*') and len(part) > 2) or \
+                 (part.startswith('_') and part.endswith('_') and len(part) > 2):
+                text_widget.insert(tk.END, part[1:-1], "italic")
+            # Inline code (`code`)
+            elif part.startswith('`') and part.endswith('`') and len(part) > 2:
+                text_widget.insert(tk.END, part[1:-1], "inline_code")
+            # Strikethrough (~~text~~)
+            elif part.startswith('~~') and part.endswith('~~') and len(part) > 4:
+                text_widget.insert(tk.END, part[2:-2], "strikethrough")
+            # Links [text](url) - simplified, just show as underlined text
+            elif i + 2 < len(parts) and parts[i+1] and parts[i+2]:
+                # This is a link match
+                if part.startswith('['):
+                    link_text = parts[i+1]
+                    text_widget.insert(tk.END, link_text, "link")
             # Regular text
-            else:
-                MarkdownRenderer._render_inline(text_widget, line, base_tag)
-                text_widget.insert(tk.END, '\n', base_tag)
-            
-            i += 1
-    
-    @staticmethod
-    def _render_inline(text_widget, text, base_tag):
-        """Render inline formatting (bold, italic, code)."""
-        pos = 0
-        
-        # Pattern: **bold**, *italic*, `code`
-        pattern = r'(\*\*.*?\*\*)|(\*.*?\*)|(`.+?`)'
-        
-        for match in re.finditer(pattern, text):
-            # Insert text before match
-            if match.start() > pos:
-                text_widget.insert(tk.END, text[pos:match.start()], base_tag)
-            
-            matched_text = match.group()
-            if matched_text.startswith('**'):
-                text_widget.insert(tk.END, matched_text[2:-2], "bold")
-            elif matched_text.startswith('*'):
-                text_widget.insert(tk.END, matched_text[1:-1], "italic")
-            elif matched_text.startswith('`'):
-                text_widget.insert(tk.END, matched_text[1:-1], "inline_code")
-            
-            pos = match.end()
-        
-        # Insert remaining text
-        if pos < len(text):
-            text_widget.insert(tk.END, text[pos:], base_tag)
-    
-    @staticmethod
-    def _extract_code_block(lines, start_idx):
-        """Extract code block content."""
-        code_lines = []
-        i = start_idx + 1
-        while i < len(lines) and not lines[i].startswith('```'):
-            code_lines.append(lines[i])
-            i += 1
-        return i, '\n'.join(code_lines)
-    
-    @staticmethod
-    def _render_table(text_widget, lines, start_idx):
-        """Render a markdown table."""
-        table_lines = []
-        i = start_idx
-        
-        # Collect table lines
-        while i < len(lines) and '|' in lines[i]:
-            table_lines.append(lines[i])
-            i += 1
-        
-        if len(table_lines) < 2:
-            return i
-        
-        # Parse table
-        rows = []
-        for line in table_lines:
-            cells = [cell.strip() for cell in line.split('|')]
-            cells = [c for c in cells if c]  # Remove empty cells
-            rows.append(cells)
-        
-        # Skip separator row (second row)
-        header = rows[0]
-        data_rows = rows[2:] if len(rows) > 2 else []
-        
-        # Calculate column widths
-        all_rows = [header] + data_rows
-        col_widths = [max(len(str(row[i])) if i < len(row) else 0 for row in all_rows) 
-                     for i in range(len(header))]
-        
-        # Render header
-        text_widget.insert(tk.END, '\n', "table")
-        header_line = '  '.join(str(header[i]).ljust(col_widths[i]) for i in range(len(header)))
-        text_widget.insert(tk.END, header_line + '\n', "table_header")
-        
-        # Render separator
-        separator = '  '.join('─' * col_widths[i] for i in range(len(header)))
-        text_widget.insert(tk.END, separator + '\n', "table")
-        
-        # Render data rows
-        for row in data_rows:
-            row_line = '  '.join(str(row[i]).ljust(col_widths[i]) if i < len(row) else ' ' * col_widths[i] 
-                                for i in range(len(header)))
-            text_widget.insert(tk.END, row_line + '\n', "table")
-        
-        text_widget.insert(tk.END, '\n', "table")
-        return i
+            elif not re.match(r'^[\[\]\(\)]+$', part):  # Skip brackets/parens from link parsing
+                text_widget.insert(tk.END, part, base_tag)
 
-# --- GUI ---
+# --- GUI APPLICATION ---
 class ModernSQLApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LAZY MYSQL WIZARD by XVP Technologies")
+        self.title("AI SQL Manager (Safe & Optimized)")
         self.geometry("1400x900")
         self.configure(bg=COLORS["bg"])
         
-        # Init Subsystems
+        # Data & Logic
         self.db = DatabaseManager(DB_CONFIG)
-        self.agency_level = tk.IntVar(value=2)  # Default to level 2
-        self.agent = Agent(self.db, agency_level=2)
+        self.agent = Agent(self.db)
+        self.agency_level = tk.IntVar(value=2)
         
+        # UI Setup
         self._setup_styles()
         self._build_layout()
-        self._configure_text_tags()
+        self._configure_tags()
         
-        # Focus handling
-        self.focus_force()
+        # Async Initialization
+        self.status_var = tk.StringVar(value="Initializing...")
+        self.status_bar = tk.Label(self, textvariable=self.status_var, bg=COLORS["accent"], fg="white", font=("Segoe UI", 9))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Start DB thread
+        threading.Thread(target=self._init_backend, daemon=True).start()
+
+    def _init_backend(self):
+        """Connects to DB in background without freezing UI."""
+        self._update_status("Connecting to Database...")
+        success, msg = self.db.connect_pool()
+        
+        if success:
+            self._update_status("Fetching Schema...")
+            self.db.get_table_names()
+            self.agent.refresh_context()
+            self._update_status(f"Ready. Connected to {self.db.config['host']}.")
+            # Enable input
+            self.after(0, lambda: self.chat_input.config(state=tk.NORMAL))
+            self.after(0, lambda: self.append_chat("system", "System Ready. Database connected."))
+        else:
+            self._update_status(f"Connection Failed: {msg}")
+            self.after(0, lambda: messagebox.showerror("Connection Error", msg))
+
+    def _update_status(self, text):
+        self.after(0, lambda: self.status_var.set(text))
 
     def _setup_styles(self):
         style = ttk.Style(self)
         style.theme_use('clam')
-        
-        # General
         style.configure("TFrame", background=COLORS["bg"])
-        style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["fg"], font=("Segoe UI", 11))
-        style.configure("TButton", background=COLORS["accent"], foreground="white", borderwidth=0, font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", background=COLORS["accent"], foreground="white", borderwidth=0)
         style.map("TButton", background=[("active", COLORS["accent_hover"])])
         
-        # Treeview (Results)
-        style.configure("Treeview", 
-                        background=COLORS["entry_bg"], 
-                        foreground=COLORS["fg"], 
-                        fieldbackground=COLORS["entry_bg"],
-                        borderwidth=0,
-                        rowheight=25,
-                        font=("Consolas", 10))
+        style.configure("Treeview", background=COLORS["entry_bg"], foreground=COLORS["fg"], fieldbackground=COLORS["entry_bg"], font=("Consolas", 10))
         style.configure("Treeview.Heading", background=COLORS["border"], foreground="white", relief="flat")
-        style.map("Treeview", background=[("selected", COLORS["accent"])])
 
     def _build_layout(self):
-        # Main Split: Left (Chat) vs Right (SQL + Results)
         main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # --- LEFT: CHAT ---
-        chat_frame = ttk.Frame(main_pane)
-        main_pane.add(chat_frame, weight=1)
+        # LEFT: CHAT
+        left_frame = ttk.Frame(main_pane)
+        main_pane.add(left_frame, weight=4)
         
-        # Agency Level Selector
-        agency_toolbar = ttk.Frame(chat_frame)
-        agency_toolbar.pack(fill=tk.X, pady=(0, 5))
+        # Toolbar
+        tool_frame = ttk.Frame(left_frame)
+        tool_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Label(agency_toolbar, text="AI Agency Level:").pack(side=tk.LEFT, padx=5)
-        
-        agency_frame = tk.Frame(agency_toolbar, bg=COLORS["bg"])
-        agency_frame.pack(side=tk.LEFT, padx=5)
-        
-        level_descriptions = [
-            (1, "Level 1: Draft Only"),
-            (2, "Level 2: Moderate"),
-            (3, "Level 3: Full Auto")
-        ]
-        
-        for level, desc in level_descriptions:
-            rb = tk.Radiobutton(
-                agency_frame, text=desc, variable=self.agency_level, value=level,
-                bg=COLORS["bg"], fg=COLORS["fg"], selectcolor=COLORS["entry_bg"],
-                activebackground=COLORS["bg"], activeforeground=COLORS["accent"],
-                font=("Segoe UI", 9), command=self.on_agency_change
-            )
-            rb.pack(side=tk.LEFT, padx=5)
-        
-        # Token Counter
-        self.token_label = tk.Label(
-            agency_toolbar, text="Tokens: In: 0 | Out: 0 | Cost: $0.00",
-            bg=COLORS["bg"], fg=COLORS["success"], font=("Segoe UI", 9, "bold")
-        )
-        self.token_label.pack(side=tk.RIGHT, padx=10)
-        
-        # Chat History with improved font rendering
-        chat_font = font.Font(family="Segoe UI", size=11)
-        self.chat_display = scrolledtext.ScrolledText(
-            chat_frame, bg=COLORS["entry_bg"], fg=COLORS["fg"], 
-            font=chat_font, wrap=tk.WORD, borderwidth=0, padx=10, pady=10
-        )
-        self.chat_display.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        self.chat_display.config(state=tk.DISABLED)
+        ttk.Label(tool_frame, text="Autonomy:", background=COLORS["bg"], foreground="white").pack(side=tk.LEFT)
+        for i, text in [(1, "Draft"), (2, "Standard"), (3, "Full")]:
+            tk.Radiobutton(tool_frame, text=text, variable=self.agency_level, value=i, 
+                           bg=COLORS["bg"], fg="white", selectcolor=COLORS["entry_bg"], activebackground=COLORS["bg"]).pack(side=tk.LEFT, padx=5)
 
-        # Chat Input
-        input_frame = ttk.Frame(chat_frame)
-        input_frame.pack(fill=tk.X)
+        self.lbl_tokens = ttk.Label(tool_frame, text="Tokens: 0", background=COLORS["bg"], foreground=COLORS["warning"])
+        self.lbl_tokens.pack(side=tk.RIGHT)
+
+        # Chat Area
+        self.chat_display = scrolledtext.ScrolledText(left_frame, bg=COLORS["entry_bg"], fg=COLORS["fg"], font=("Segoe UI", 11), wrap=tk.WORD, borderwidth=0)
+        self.chat_display.pack(fill=tk.BOTH, expand=True)
         
-        self.chat_input = tk.Text(input_frame, height=3, bg=COLORS["entry_bg"], fg="white", 
-                                  insertbackground="white", font=("Segoe UI", 11), borderwidth=1, relief="solid")
+        # Input
+        input_cont = ttk.Frame(left_frame)
+        input_cont.pack(fill=tk.X, pady=5)
+        self.chat_input = tk.Text(input_cont, height=3, bg=COLORS["entry_bg"], fg="white", font=("Segoe UI", 11), state=tk.DISABLED)
         self.chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.chat_input.bind("<Control-Return>", self.on_send_chat)
+        self.chat_input.bind("<Return>", self.on_send)
+        self.chat_input.bind("<Shift-Return>", lambda e: None) # Allow newlines
+        
+        ttk.Button(input_cont, text="Send", command=self.on_send).pack(side=tk.RIGHT, fill=tk.Y, padx=5)
 
-        send_btn = ttk.Button(input_frame, text="Send", command=self.on_send_chat)
-        send_btn.pack(side=tk.RIGHT, padx=5, fill=tk.Y)
-
-        # --- RIGHT: SQL & RESULTS ---
-        right_pane = ttk.PanedWindow(main_pane, orient=tk.VERTICAL)
-        main_pane.add(right_pane, weight=3)
-
+        # RIGHT: SQL & RESULTS
+        right_frame = ttk.Frame(main_pane)
+        main_pane.add(right_frame, weight=6)
+        
         # SQL Editor
-        sql_frame = ttk.Frame(right_pane)
-        right_pane.add(sql_frame, weight=1)
+        self.sql_editor = scrolledtext.ScrolledText(right_frame, bg=COLORS["entry_bg"], fg=COLORS["success"], font=("Consolas", 12), height=8)
+        self.sql_editor.pack(fill=tk.X, pady=(0,5))
         
-        lbl_sql = ttk.Label(sql_frame, text="SQL Editor (Agent Drafts Here)")
-        lbl_sql.pack(anchor="w", pady=5)
+        btn_bar = ttk.Frame(right_frame)
+        btn_bar.pack(fill=tk.X)
+        ttk.Button(btn_bar, text="Run SQL Manually", command=self.run_manual_sql).pack(side=tk.RIGHT)
         
-        self.sql_editor = scrolledtext.ScrolledText(
-            sql_frame, bg=COLORS["entry_bg"], fg=COLORS["success"], 
-            font=("Consolas", 12), insertbackground="white", height=10
-        )
-        self.sql_editor.pack(fill=tk.BOTH, expand=True)
-
-        btn_toolbar = ttk.Frame(sql_frame)
-        btn_toolbar.pack(fill=tk.X, pady=5)
-        ttk.Button(btn_toolbar, text="Run SQL Manually", command=self.run_manual_sql).pack(side=tk.RIGHT)
-        ttk.Button(btn_toolbar, text="Clear", command=lambda: self.sql_editor.delete("1.0", tk.END)).pack(side=tk.RIGHT, padx=5)
-
-        # Results
-        results_frame = ttk.Frame(right_pane)
-        right_pane.add(results_frame, weight=3)
-        
-        self.tree = ttk.Treeview(results_frame, show='headings')
-        vsb = ttk.Scrollbar(results_frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(results_frame, orient="horizontal", command=self.tree.xview)
+        # Results Table
+        self.tree = ttk.Treeview(right_frame, show='headings')
+        vsb = ttk.Scrollbar(right_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(right_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=5)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def _configure_text_tags(self):
-        """Configure text tags for markdown rendering."""
-        # User/AI message tags
-        self.chat_display.tag_config("user", foreground="#ffffff", background=COLORS["chat_user"], 
-                                     lmargin1=10, lmargin2=10, rmargin=50, spacing1=5, spacing3=5)
-        self.chat_display.tag_config("ai", foreground="#ffffff", background=COLORS["chat_ai"], 
-                                     lmargin1=10, lmargin2=10, rmargin=50, spacing1=5, spacing3=5)
-        self.chat_display.tag_config("system", foreground=COLORS["warning"], 
-                                     font=("Segoe UI", 10, "italic"))
+    def _configure_tags(self):
+        self.chat_display.tag_config("user", foreground="#ffffff", background=COLORS["chat_user"], lmargin1=10, rmargin=50)
+        self.chat_display.tag_config("ai", foreground="#ffffff", background=COLORS["chat_ai"], lmargin1=10, rmargin=50)
+        self.chat_display.tag_config("system", foreground=COLORS["warning"], font=("Segoe UI", 9, "italic"))
         
-        # Markdown formatting tags
-        bold_font = font.Font(family="Segoe UI", size=11, weight="bold")
-        italic_font = font.Font(family="Segoe UI", size=11, slant="italic")
-        code_font = font.Font(family="Consolas", size=10)
-        header1_font = font.Font(family="Segoe UI", size=16, weight="bold")
-        header2_font = font.Font(family="Segoe UI", size=14, weight="bold")
-        header3_font = font.Font(family="Segoe UI", size=12, weight="bold")
+        # Code formatting
+        self.chat_display.tag_config("code_block", font=("Consolas", 10), background="#111", foreground=COLORS["success"])
+        self.chat_display.tag_config("inline_code", font=("Consolas", 10), background="#2d2d30", foreground=COLORS["success"])
         
-        self.chat_display.tag_config("bold", font=bold_font, foreground="#ffffff")
-        self.chat_display.tag_config("italic", font=italic_font, foreground="#d4d4d4")
-        self.chat_display.tag_config("inline_code", font=code_font, 
-                                     background="#2d2d30", foreground="#ce9178")
-        self.chat_display.tag_config("code_block", font=code_font, 
-                                     background="#1e1e1e", foreground="#4ec9b0",
-                                     lmargin1=20, lmargin2=20, spacing1=5, spacing3=5)
+        # Text formatting
+        self.chat_display.tag_config("bold", font=("Segoe UI", 11, "bold"))
+        self.chat_display.tag_config("italic", font=("Segoe UI", 11, "italic"))
+        self.chat_display.tag_config("bold_italic", font=("Segoe UI", 11, "bold italic"))
+        self.chat_display.tag_config("strikethrough", font=("Segoe UI", 11), overstrike=True)
         
         # Headers
-        self.chat_display.tag_config("header1", font=header1_font, foreground="#569cd6", spacing1=10, spacing3=5)
-        self.chat_display.tag_config("header2", font=header2_font, foreground="#569cd6", spacing1=8, spacing3=4)
-        self.chat_display.tag_config("header3", font=header3_font, foreground="#569cd6", spacing1=6, spacing3=3)
+        self.chat_display.tag_config("h1", font=("Segoe UI", 18, "bold"), foreground="#4ec9b0")
+        self.chat_display.tag_config("h2", font=("Segoe UI", 16, "bold"), foreground="#4ec9b0")
+        self.chat_display.tag_config("h3", font=("Segoe UI", 14, "bold"), foreground="#4ec9b0")
+        self.chat_display.tag_config("h4", font=("Segoe UI", 12, "bold"), foreground="#9cdcfe")
+        self.chat_display.tag_config("h5", font=("Segoe UI", 11, "bold"), foreground="#9cdcfe")
+        self.chat_display.tag_config("h6", font=("Segoe UI", 10, "bold"), foreground="#9cdcfe")
         
-        # Table formatting
-        table_font = font.Font(family="Consolas", size=10)
-        self.chat_display.tag_config("table", font=table_font, foreground="#d4d4d4",
-                                     lmargin1=20, lmargin2=20)
-        self.chat_display.tag_config("table_header", font=font.Font(family="Consolas", size=10, weight="bold"),
-                                     foreground="#4ec9b0", lmargin1=20, lmargin2=20)
-
-    # --- LOGIC HANDLING ---
-
-    def update_token_display(self):
-        """Update the token counter display."""
-        input_tokens = self.agent.total_input_tokens
-        output_tokens = self.agent.total_output_tokens
-        total_tokens = input_tokens + output_tokens
-        
-        # Calculate cost if pricing is configured
-        if TOKEN_INPUT_PRICE_PER_M is not None and TOKEN_OUTPUT_PRICE_PER_M is not None:
-            input_cost = (input_tokens / 1_000_000) * TOKEN_INPUT_PRICE_PER_M
-            output_cost = (output_tokens / 1_000_000) * TOKEN_OUTPUT_PRICE_PER_M
-            total_cost = input_cost + output_cost
-            cost_text = f"${total_cost:.4f}"
-        else:
-            cost_text = "?"
-        
-        self.token_label.config(
-            text=f"Tokens: In: {input_tokens:,} | Out: {output_tokens:,} | Cost: {cost_text}"
-        )
-    
-    def on_agency_change(self):
-        """Handle agency level change."""
-        new_level = self.agency_level.get()
-        self.agent.set_agency_level(new_level)
-        
-        level_names = {1: "Draft Only", 2: "Moderate", 3: "Full Auto"}
-        self.append_chat("system", f"Agency level changed to {new_level}: {level_names[new_level]}")
+        # Other elements
+        self.chat_display.tag_config("link", foreground="#3794ff", underline=True)
+        self.chat_display.tag_config("blockquote", foreground="#808080", lmargin1=20, font=("Segoe UI", 10, "italic"))
+        self.chat_display.tag_config("list", foreground=COLORS["fg"])
+        self.chat_display.tag_config("hr", foreground=COLORS["border"])
 
     def append_chat(self, role, text):
         self.chat_display.config(state=tk.NORMAL)
-        if role == "user":
-            label_font = font.Font(family="Segoe UI", size=9, weight="bold")
-            self.chat_display.insert(tk.END, "\n")
-            self.chat_display.insert(tk.END, " YOU ", "user")
-            self.chat_display.tag_config("user_label", font=label_font)
-            self.chat_display.insert(tk.END, "\n")
-            self.chat_display.insert(tk.END, f"{text}\n", "user")
-        elif role == "agent":
-            label_font = font.Font(family="Segoe UI", size=9, weight="bold")
-            self.chat_display.insert(tk.END, "\n")
-            self.chat_display.insert(tk.END, " AGENT ", "ai")
-            self.chat_display.tag_config("ai_label", font=label_font)
-            self.chat_display.insert(tk.END, "\n")
-            # Render markdown for agent responses
-            MarkdownRenderer.render(self.chat_display, text, "ai")
-        elif role == "system":
-            self.chat_display.insert(tk.END, f"[{text}]\n", "system")
+        self.chat_display.insert(tk.END, f"\n[{role.upper()}]\n", "system")
+        MarkdownRenderer.render(self.chat_display, text, role)
         self.chat_display.see(tk.END)
         self.chat_display.config(state=tk.DISABLED)
 
-    def on_send_chat(self, event=None):
+    def on_send(self, event=None):
+        if event and event.keysym == 'Return' and not event.state & 0x0001: # Check shift
+            pass
+        else:
+            return 
+            
         msg = self.chat_input.get("1.0", tk.END).strip()
         if not msg: return "break"
         
         self.chat_input.delete("1.0", tk.END)
         self.append_chat("user", msg)
         
-        # Threading to prevent GUI freeze
-        threading.Thread(target=self._run_agent_thread, args=(msg,), daemon=True).start()
+        threading.Thread(target=self._run_agent, args=(msg,), daemon=True).start()
         return "break"
 
-    def _run_agent_thread(self, user_msg):
-        self.append_chat("system", "Thinking...")
-        try:
-            response = self.agent.chat(user_msg, self.handle_tool_execution)
-            self.after(0, lambda: self.append_chat("agent", response))
-            self.after(0, self.update_token_display)
-        except Exception as e:
-            self.after(0, lambda: self.append_chat("system", f"Critical Error: {e}"))
-
-    def handle_tool_execution(self, name, args):
-        """Called by the Agent when it wants to do something."""
+    def _run_agent(self, msg):
+        self.current_stream = ""
         
+        # 1. Prepare UI (Header + Spacing) on main thread
+        self.after(0, self.start_streaming_message)
+
+        # 2. Callback for raw streaming
+        def callback(chunk):
+            self.current_stream += chunk
+            self.after(0, lambda: self._stream_raw_chunk(chunk))
+
+        # 3. Agent Logic
+        try:
+            final_text = self.agent.chat(msg, self.handle_tool, callback)
+            
+            # 4. Finalize (Replace raw text with Markdown)
+            self.after(0, lambda: self.finalize_streaming_message(final_text))
+            self.after(0, self._update_token_display)
+            
+        except Exception as e:
+            self.after(0, lambda: self.append_chat("system", f"Error: {e}"))
+
+    def start_streaming_message(self):
+        """Prepares chat window with [AGENT] header and proper spacing."""
+        self.chat_display.config(state=tk.NORMAL)
+        
+        # A. Force separation from previous message if needed
+        if self.chat_display.get("end-2c", "end-1c") != "\n":
+            self.chat_display.insert(tk.END, "\n")
+        
+        # B. Add an empty line above the header
+        self.chat_display.insert(tk.END, "\n")
+        
+        # C. Insert Header with an EXTRA newline below it
+        self.chat_display.insert(tk.END, "[AGENT]\n\n", "system")
+        
+        # D. Set the 'stream_start' mark AFTER that extra newline.
+        # This protects the header and the empty line from being deleted later.
+        self.chat_display.mark_set("stream_start", "end-1c")
+        self.chat_display.mark_gravity("stream_start", tk.LEFT)
+        
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+
+    def _stream_raw_chunk(self, chunk):
+        """Inserts raw text during streaming."""
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.insert(tk.END, chunk, "ai")
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+
+    def finalize_streaming_message(self, final_text):
+        """Replaces raw text with Markdown."""
+        if not final_text: return
+        
+        if "stream_start" not in self.chat_display.mark_names():
+            return
+
+        self.chat_display.config(state=tk.NORMAL)
+        
+        # 1. Delete raw text (Header and gap remain safe above 'stream_start')
+        self.chat_display.delete("stream_start", tk.END)
+        
+        # 2. Render Markdown
+        MarkdownRenderer.render(self.chat_display, final_text, "ai")
+        
+        # 3. Add trailing newline for next user message
+        self.chat_display.insert(tk.END, "\n")
+        
+        self.chat_display.mark_unset("stream_start")
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+
+    def _finalize_markdown_render(self, full_text):
+        """Deletes the raw stream and re-inserts as formatted Markdown."""
+        if not full_text: return
+        
+        self.chat_display.config(state=tk.NORMAL)
+        
+        # Delete the raw text from our start mark to the end
+        self.chat_display.delete("response_start", tk.END)
+        
+        # Re-insert using the Markdown Renderer
+        MarkdownRenderer.render(self.chat_display, full_text, "ai")
+        
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state=tk.DISABLED)
+
+    def _update_token_display(self):
+        t_in = self.agent.tokens_in
+        t_out = self.agent.tokens_out
+        self.lbl_tokens.config(text=f"Tokens: {t_in + t_out} (In: {t_in}, Out: {t_out})")
+
+    def handle_tool(self, name, args):
         if name == "ask_user_clarification":
-            # The agent wants to ask the user something before proceeding
-            question = args.get('question')
-            return f"Ask the user: {question}" # The agent will output this as text
+            return args.get("question")
+        
+        if name == "get_table_details":
+            table = args.get("table_name")
+            self.after(0, lambda: self.append_chat("system", f"Fetching schema for: {table}..."))
+            return self.db.get_table_details(table)
 
         if name == "run_sql_query":
-            query = args.get('query')
+            query = args.get("query")
             
-            # Update the SQL editor so the user sees what's happening
+            # Update Editor
             self.after(0, lambda: self.sql_editor.delete("1.0", tk.END))
             self.after(0, lambda: self.sql_editor.insert(tk.END, query))
             
-            # LEVEL 1: Never auto-execute, just draft
-            if self.agent.agency_level == 1:
-                self.after(0, lambda: self.append_chat("system", "Query drafted. Review and click 'Run SQL Manually' to execute."))
-                return "Query has been drafted in the SQL Editor. User will review and execute manually."
+            # 1. Level 1: Draft Only
+            if self.agency_level.get() == 1:
+                return "Query drafted in editor. User must run manually."
             
-            # SAFETY CHECK
-            is_destructive = any(kw in query.upper() for kw in ["DELETE", "UPDATE", "DROP", "TRUNCATE", "ALTER"])
+            # 2. Safety Check
+            is_safe, cmd = SQLValidator.is_safe_read_only(query)
+            if not is_safe:
+                msg = f"HALTED: Destructive command '{cmd}' detected. Please click 'Run SQL Manually' if you are sure."
+                self.after(0, lambda: messagebox.showwarning("Safety Block", msg))
+                return msg
             
-            if is_destructive:
-                # Always require manual execution for destructive queries
-                return "HALTED: Destructive actions (DELETE/UPDATE/DROP/ALTER) must be reviewed and clicked 'Run SQL Manually' by the user in the interface for safety."
+            # 3. Execution
+            cols, rows, err = self.db.execute_query(query)
+            if err: return f"DB Error: {err}"
             
-            # LEVEL 2: Execute simple queries, but warn on complex ones
-            if self.agent.agency_level == 2:
-                # Check if this looks like a complex query (JOINs, subqueries, etc.)
-                is_complex = any(kw in query.upper() for kw in ["JOIN", "UNION", "SUBQUERY", "EXISTS", "CASE WHEN"])
-                if is_complex:
-                    self.after(0, lambda: self.append_chat("system", "Complex query detected. Review in SQL Editor."))
-            
-            # LEVEL 2 & 3: Execute safe queries
-            columns, rows, error = self.db.execute_query(query)
-            
-            if error:
-                return f"Database Error: {error}"
-            
-            # Update UI Table
-            self.after(0, lambda: self.populate_results(columns, rows))
-            
-            # Return summary to AI (don't return huge datasets to LLM token context)
-            if len(rows) > 10:
-                return f"Success. Retrieved {len(rows)} rows. Columns: {columns}. First 3 rows: {rows[:3]}"
+            self.after(0, lambda: self.populate_results(cols, rows))
+            if len(rows) > 5:
+                return f"Success. {len(rows)} rows. Top 5: {rows[:5]}"
             return f"Success. Data: {rows}"
 
     def run_manual_sql(self):
         query = self.sql_editor.get("1.0", tk.END).strip()
         if not query: return
         
-        # Show the query being executed in chat
-        self.append_chat("system", f"User manually executing query:\n```sql\n{query}\n```")
-        
-        # Add to agent's conversation history so AI is aware
-        self.agent.history.append({
-            "role": "user",
-            "content": f"I manually executed this SQL query:\n```sql\n{query}\n```"
-        })
-        
+        # Manual bypasses safety checks in Agent, but user accepts risk
         cols, rows, err = self.db.execute_query(query)
         if err:
-            messagebox.showerror("SQL Error", err)
-            # Inform agent about the error
-            self.agent.history.append({
-                "role": "assistant",
-                "content": f"The query resulted in an error: {err}"
-            })
-            self.append_chat("system", f"Query failed: {err}")
+            messagebox.showerror("Error", err)
         else:
             self.populate_results(cols, rows)
-            result_msg = f"Query executed successfully. {len(rows)} rows returned."
-            self.append_chat("system", result_msg)
-            # Inform agent about the success
-            self.agent.history.append({
-                "role": "assistant",
-                "content": result_msg
-            })
+            self.append_chat("system", f"Manual Query: {len(rows)} rows returned.")
 
     def populate_results(self, columns, rows):
         self.tree.delete(*self.tree.get_children())
         self.tree["columns"] = columns
-        
         for col in columns:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=100) # Adjust width dynamically if needed
-            
+            self.tree.column(col, width=120)
+        
         for row in rows:
             self.tree.insert("", tk.END, values=list(row))
 
