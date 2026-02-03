@@ -36,6 +36,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID")
 
+# Token pricing (cost per 1M tokens) - optional, set in .env if you want cost tracking
+TOKEN_INPUT_PRICE_PER_M = float(os.getenv("TOKEN_INPUT_PRICE_PER_M")) if os.getenv("TOKEN_INPUT_PRICE_PER_M") else None
+TOKEN_OUTPUT_PRICE_PER_M = float(os.getenv("TOKEN_OUTPUT_PRICE_PER_M")) if os.getenv("TOKEN_OUTPUT_PRICE_PER_M") else None
+
 # --- STYLES ---
 COLORS = {
     "bg": "#1e1e1e",
@@ -121,6 +125,9 @@ class Agent:
         self.history = []
         self.agency_level = agency_level
         self.system_prompt = self._get_system_prompt()
+        # Token tracking
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
         # Initialize history with schema context
         self.refresh_context()
     
@@ -214,6 +221,11 @@ class Agent:
                 tool_choice="auto"
             )
             
+            # Track token usage
+            if hasattr(response, 'usage') and response.usage:
+                self.total_input_tokens += response.usage.prompt_tokens
+                self.total_output_tokens += response.usage.completion_tokens
+            
             message = response.choices[0].message
             self.history.append(message)
 
@@ -238,6 +250,12 @@ class Agent:
                     model=self.model,
                     messages=self.history
                 )
+                
+                # Track token usage
+                if hasattr(final_response, 'usage') and final_response.usage:
+                    self.total_input_tokens += final_response.usage.prompt_tokens
+                    self.total_output_tokens += final_response.usage.completion_tokens
+                
                 final_msg = final_response.choices[0].message
                 self.history.append(final_msg)
                 return final_msg.content
@@ -381,7 +399,7 @@ class MarkdownRenderer:
 class ModernSQLApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AI Data Agent")
+        self.title("LAZY MYSQL WIZARD by XVP Technologies")
         self.geometry("1400x900")
         self.configure(bg=COLORS["bg"])
         
@@ -450,6 +468,13 @@ class ModernSQLApp(tk.Tk):
                 font=("Segoe UI", 9), command=self.on_agency_change
             )
             rb.pack(side=tk.LEFT, padx=5)
+        
+        # Token Counter
+        self.token_label = tk.Label(
+            agency_toolbar, text="Tokens: In: 0 | Out: 0 | Cost: $0.00",
+            bg=COLORS["bg"], fg=COLORS["success"], font=("Segoe UI", 9, "bold")
+        )
+        self.token_label.pack(side=tk.RIGHT, padx=10)
         
         # Chat History with improved font rendering
         chat_font = font.Font(family="Segoe UI", size=11)
@@ -547,6 +572,25 @@ class ModernSQLApp(tk.Tk):
 
     # --- LOGIC HANDLING ---
 
+    def update_token_display(self):
+        """Update the token counter display."""
+        input_tokens = self.agent.total_input_tokens
+        output_tokens = self.agent.total_output_tokens
+        total_tokens = input_tokens + output_tokens
+        
+        # Calculate cost if pricing is configured
+        if TOKEN_INPUT_PRICE_PER_M is not None and TOKEN_OUTPUT_PRICE_PER_M is not None:
+            input_cost = (input_tokens / 1_000_000) * TOKEN_INPUT_PRICE_PER_M
+            output_cost = (output_tokens / 1_000_000) * TOKEN_OUTPUT_PRICE_PER_M
+            total_cost = input_cost + output_cost
+            cost_text = f"${total_cost:.4f}"
+        else:
+            cost_text = "?"
+        
+        self.token_label.config(
+            text=f"Tokens: In: {input_tokens:,} | Out: {output_tokens:,} | Cost: {cost_text}"
+        )
+    
     def on_agency_change(self):
         """Handle agency level change."""
         new_level = self.agency_level.get()
@@ -593,6 +637,7 @@ class ModernSQLApp(tk.Tk):
         try:
             response = self.agent.chat(user_msg, self.handle_tool_execution)
             self.after(0, lambda: self.append_chat("agent", response))
+            self.after(0, self.update_token_display)
         except Exception as e:
             self.after(0, lambda: self.append_chat("system", f"Critical Error: {e}"))
 
@@ -648,12 +693,33 @@ class ModernSQLApp(tk.Tk):
         query = self.sql_editor.get("1.0", tk.END).strip()
         if not query: return
         
+        # Show the query being executed in chat
+        self.append_chat("system", f"User manually executing query:\n```sql\n{query}\n```")
+        
+        # Add to agent's conversation history so AI is aware
+        self.agent.history.append({
+            "role": "user",
+            "content": f"I manually executed this SQL query:\n```sql\n{query}\n```"
+        })
+        
         cols, rows, err = self.db.execute_query(query)
         if err:
             messagebox.showerror("SQL Error", err)
+            # Inform agent about the error
+            self.agent.history.append({
+                "role": "assistant",
+                "content": f"The query resulted in an error: {err}"
+            })
+            self.append_chat("system", f"Query failed: {err}")
         else:
             self.populate_results(cols, rows)
-            self.append_chat("system", f"Executed manual query. {len(rows)} rows returned.")
+            result_msg = f"Query executed successfully. {len(rows)} rows returned."
+            self.append_chat("system", result_msg)
+            # Inform agent about the success
+            self.agent.history.append({
+                "role": "assistant",
+                "content": result_msg
+            })
 
     def populate_results(self, columns, rows):
         self.tree.delete(*self.tree.get_children())
