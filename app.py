@@ -37,7 +37,9 @@ DB_CONFIG = {
 DB_CONFIG = {k: v for k, v in DB_CONFIG.items() if v is not None}
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "gpt-4-turbo")
+OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID")
+TOKEN_OUTPUT_PRICE_PER_M = float(os.getenv("TOKEN_OUTPUT_PRICE_PER_M", 0))
+TOKEN_INPUT_PRICE_PER_M = float(os.getenv("TOKEN_INPUT_PRICE_PER_M", 0))
 
 # --- STYLES ---
 COLORS = {
@@ -514,7 +516,7 @@ class ModernSQLApp(tk.Tk):
             tk.Radiobutton(tool_frame, text=text, variable=self.agency_level, value=i, 
                            bg=COLORS["bg"], fg="white", selectcolor=COLORS["entry_bg"], activebackground=COLORS["bg"]).pack(side=tk.LEFT, padx=5)
 
-        self.lbl_tokens = ttk.Label(tool_frame, text="Tokens: 0", background=COLORS["bg"], foreground=COLORS["warning"])
+        self.lbl_tokens = ttk.Label(tool_frame, text="Cost: $0 | Tokens: 0↓ 0↑", background=COLORS["bg"], foreground=COLORS["warning"])
         self.lbl_tokens.pack(side=tk.RIGHT)
 
         # Chat Area
@@ -695,7 +697,8 @@ class ModernSQLApp(tk.Tk):
     def _update_token_display(self):
         t_in = self.agent.tokens_in
         t_out = self.agent.tokens_out
-        self.lbl_tokens.config(text=f"Tokens: {t_in + t_out} (In: {t_in}, Out: {t_out})")
+        cost = (t_in * TOKEN_INPUT_PRICE_PER_M + t_out * TOKEN_OUTPUT_PRICE_PER_M)
+        self.lbl_tokens.config(text=f"Cost: ${cost:.5g} | Tokens: {t_in}↓ {t_out}↑")
 
     def handle_tool(self, name, args):
         if name == "ask_user_clarification":
