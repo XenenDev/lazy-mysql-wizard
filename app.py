@@ -26,7 +26,7 @@ load_dotenv()
 DB_CONFIG = {
     'host': os.getenv("DB_HOST"),
     'user': os.getenv("DB_USER"),
-    'password': os.getenv("DB_PASS"),
+    'password': os.getenv("DB_PASS"), # Please rotate this password
     'database': os.getenv("DB_NAME"),
     'port': int(os.getenv("DB_PORT")),
     'ssl_disabled': False
@@ -68,21 +68,105 @@ class DatabaseManager:
             return None
 
     def get_schema_summary(self):
-        """Fetches table names and columns to give the AI context."""
+        """Fetches comprehensive database schema information to give the AI context."""
         conn = self.connect()
         if not conn:
             return "Error: Could not connect to database."
         
-        schema_str = "Database Schema:\n"
+        schema_str = "=== DATABASE INFORMATION ===\n"
         try:
             cursor = conn.cursor()
+            
+            # Get MySQL version
+            cursor.execute("SELECT VERSION()")
+            version = cursor.fetchone()[0]
+            schema_str += f"MySQL Version: {version}\n"
+            
+            # Get database name and default character set/collation
+            cursor.execute("SELECT DATABASE()")
+            db_name = cursor.fetchone()[0]
+            cursor.execute(f"SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{db_name}'")
+            charset_info = cursor.fetchone()
+            if charset_info:
+                schema_str += f"Database: {db_name}\n"
+                schema_str += f"Default Character Set: {charset_info[0]}\n"
+                schema_str += f"Default Collation: {charset_info[1]}\n"
+            
+            schema_str += "\n=== TABLES ===\n"
+            
+            # Get all tables
             cursor.execute("SHOW TABLES")
             tables = cursor.fetchall()
             
             for (table_name,) in tables:
+                schema_str += f"\n--- Table: {table_name} ---\n"
+                
+                # Get table metadata (engine, collation, auto_increment, etc.)
+                cursor.execute(f"""
+                    SELECT ENGINE, TABLE_COLLATION, AUTO_INCREMENT, TABLE_ROWS, 
+                           AVG_ROW_LENGTH, DATA_LENGTH, CREATE_TIME, UPDATE_TIME
+                    FROM information_schema.TABLES 
+                    WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}'
+                """)
+                table_info = cursor.fetchone()
+                if table_info:
+                    schema_str += f"  Engine: {table_info[0]}\n"
+                    schema_str += f"  Collation: {table_info[1]}\n"
+                    if table_info[2]:
+                        schema_str += f"  Auto Increment: {table_info[2]}\n"
+                    schema_str += f"  Approx Rows: {table_info[3]}\n"
+                
+                # Get detailed column information
                 cursor.execute(f"DESCRIBE {table_name}")
-                columns = [col[0] for col in cursor.fetchall()]
-                schema_str += f"- Table '{table_name}': {', '.join(columns)}\n"
+                columns = cursor.fetchall()
+                schema_str += "  Columns:\n"
+                for col in columns:
+                    col_name, col_type, nullable, key, default, extra = col
+                    col_desc = f"    - {col_name} ({col_type})"
+                    if key == 'PRI':
+                        col_desc += " PRIMARY KEY"
+                    if key == 'MUL':
+                        col_desc += " INDEXED"
+                    if key == 'UNI':
+                        col_desc += " UNIQUE"
+                    if nullable == 'NO':
+                        col_desc += " NOT NULL"
+                    if default is not None:
+                        col_desc += f" DEFAULT {default}"
+                    if extra:
+                        col_desc += f" {extra}"
+                    schema_str += col_desc + "\n"
+                
+                # Get indexes
+                cursor.execute(f"SHOW INDEX FROM {table_name}")
+                indexes = cursor.fetchall()
+                if indexes:
+                    index_dict = {}
+                    for idx in indexes:
+                        idx_name = idx[2]
+                        col_name = idx[4]
+                        if idx_name not in index_dict:
+                            index_dict[idx_name] = []
+                        index_dict[idx_name].append(col_name)
+                    
+                    schema_str += "  Indexes:\n"
+                    for idx_name, cols in index_dict.items():
+                        if idx_name != 'PRIMARY':
+                            schema_str += f"    - {idx_name} ({', '.join(cols)})\n"
+                
+                # Get foreign keys
+                cursor.execute(f"""
+                    SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = '{db_name}' 
+                    AND TABLE_NAME = '{table_name}'
+                    AND REFERENCED_TABLE_NAME IS NOT NULL
+                """)
+                foreign_keys = cursor.fetchall()
+                if foreign_keys:
+                    schema_str += "  Foreign Keys:\n"
+                    for fk in foreign_keys:
+                        schema_str += f"    - {fk[1]} -> {fk[2]}.{fk[3]}\n"
             
             conn.close()
             self.schema_cache = schema_str
