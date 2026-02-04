@@ -447,7 +447,7 @@ class MarkdownRenderer:
 class ModernSQLApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AI SQL Manager (Safe & Optimized)")
+        self.title("Lazy MySQL Wizard - XVP Technologies")
         self.geometry("1400x900")
         self.configure(bg=COLORS["bg"])
         
