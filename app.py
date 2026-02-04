@@ -697,7 +697,7 @@ class ModernSQLApp(tk.Tk):
     def _update_token_display(self):
         t_in = self.agent.tokens_in
         t_out = self.agent.tokens_out
-        cost = (t_in * TOKEN_INPUT_PRICE_PER_M + t_out * TOKEN_OUTPUT_PRICE_PER_M)
+        cost = (t_in * 1e-6 * TOKEN_INPUT_PRICE_PER_M + t_out * 1e-6* TOKEN_OUTPUT_PRICE_PER_M)
         self.lbl_tokens.config(text=f"Cost: ${cost:.5g} | Tokens: {t_in}↓ {t_out}↑")
 
     def handle_tool(self, name, args):
